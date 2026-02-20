@@ -40,6 +40,7 @@ from .config import settings
 from .db import (
     DBOperationalError,
     get_db_connection_error_payload,
+    get_cursor,
     log_db_connection_target_once,
     validate_db_server_for_startup,
 )
@@ -205,6 +206,34 @@ def _send_reset_email(to_email: str, username: str, reset_url: str) -> None:
 @app.get("/healthz")
 def healthcheck() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/health/db")
+def db_healthcheck() -> dict[str, bool]:
+    try:
+        with get_cursor() as cursor:
+            cursor.execute("SELECT 1 AS ok")
+            row = cursor.fetchone() or {}
+    except DBOperationalError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                **get_db_connection_error_payload(),
+                "reason": str(exc),
+            },
+        ) from exc
+
+    ok_value = row.get("ok")
+    if ok_value is None:
+        ok_value = row.get("OK")
+
+    if isinstance(ok_value, bool):
+        return {"ok": ok_value}
+    if isinstance(ok_value, int):
+        return {"ok": ok_value == 1}
+    if ok_value is None:
+        return {"ok": False}
+    return {"ok": str(ok_value).strip() in {"1", "true", "TRUE", "True"}}
 
 
 @app.post("/api/auth/login", response_model=AuthResponse)
