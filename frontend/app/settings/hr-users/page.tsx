@@ -1,5 +1,5 @@
-import SettingsClient from "@/components/settings-client";
+import { redirect } from "next/navigation";
 
-export default function HrUsersSettingsPage() {
-  return <SettingsClient section="hr-users" />;
+export default function LegacyHrUsersPage() {
+  redirect("/settings/users");
 }

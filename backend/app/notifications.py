@@ -128,12 +128,12 @@ def _build_status(
 
 def _subject_for_type(notice_type: str, date_value: str) -> str:
     if notice_type == "LATE":
-        return f"Attendance Notice: Late Check-in - {date_value}"
+        return f"Entry/Exit Notice: Late Check-in - {date_value}"
     if notice_type == "EARLY":
-        return f"Attendance Notice: Early Check-out - {date_value}"
+        return f"Entry/Exit Notice: Early Check-out - {date_value}"
     if notice_type == "LATE_EARLY":
-        return f"Attendance Notice: Late Check-in / Early Check-out - {date_value}"
-    return f"Attendance Notice: Missing Punch - {date_value}"
+        return f"Entry/Exit Notice: Late Check-in / Early Check-out - {date_value}"
+    return f"Entry/Exit Notice: Missing Punch - {date_value}"
 
 
 def _send_email(
@@ -149,7 +149,7 @@ def _send_email(
     username = str(smtp_config.get("username") or "").strip()
     password = str(smtp_config.get("password") or "")
     from_email = str(smtp_config.get("from_email") or "").strip()
-    from_name = str(smtp_config.get("from_name") or "Oilchem HR Admin").strip() or "Oilchem HR Admin"
+    from_name = str(smtp_config.get("from_name") or "Oilchem Entry/Exit Admin").strip() or "Oilchem Entry/Exit Admin"
     use_tls = bool(smtp_config.get("use_tls"))
     use_ssl = bool(smtp_config.get("use_ssl"))
 
@@ -281,7 +281,7 @@ def run_notifications(date_value: str, card_no: str | None = None) -> dict[str, 
         subject = _subject_for_type(notice_type, date_value)
         body = "\n".join(
             [
-                "Oilchem HR Attendance Notice",
+                "Oilchem Entry/Exit Notice",
                 "",
                 f"Employee: {employee_name}",
                 f"CardNo: {card}",

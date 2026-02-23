@@ -1,5 +1,6 @@
 from collections import defaultdict
 from datetime import date, datetime, timedelta
+import logging
 from threading import Lock
 import time
 from typing import Any, Dict, List, Sequence
@@ -15,6 +16,8 @@ _SCHEMA_LOCK = Lock()
 _MAPPING_CACHE: dict[str, Any] | None = None
 _MAPPING_LOCK = Lock()
 _MAPPING_CACHE_TTL_SECONDS = 300
+_EMPLOYEE_SAMPLE_LOGGED = False
+logger = logging.getLogger(__name__)
 
 _NAME_COLUMN_CANDIDATES = (
     "EmployeeName",
@@ -25,6 +28,28 @@ _NAME_COLUMN_CANDIDATES = (
     "UserName",
     "User",
 )
+_EMPLOYEE_ID_PRIMARY_CANDIDATES = (
+    "EmployeeCode",
+    "EMPLOYEECODE",
+)
+_EMPLOYEE_ID_USERNO_CANDIDATES = (
+    "UserNo",
+    "User_No",
+    "USERNO",
+)
+_EMPLOYEE_ID_USERID_CANDIDATES = (
+    "UserId",
+    "USERID",
+    "User_ID",
+)
+_EMPLOYEE_ID_FALLBACK_CANDIDATES = (
+    "EmployeeID",
+    "EmpNo",
+    "EmpID",
+    "UserNum",
+    "EmployeeNo",
+    "EmpCode",
+)
 _DEPARTMENT_COLUMN_CANDIDATES = (
     "Department",
     "DepartmentName",
@@ -32,6 +57,35 @@ _DEPARTMENT_COLUMN_CANDIDATES = (
     "Dept",
     "DepName",
 )
+_DEPARTMENT_REF_COLUMN_CANDIDATES = (
+    "DepartmentID",
+    "DeptID",
+    "DepID",
+    "Department",
+    "Dept",
+    "DepartmentNo",
+    "DeptNo",
+    "DepNo",
+)
+_DEPARTMENT_TABLE_NAME_CANDIDATES = (
+    "TDepartment",
+    "Department",
+    "TDept",
+    "Dept",
+    "TBDepartment",
+)
+_NUMERIC_SQL_TYPES = {
+    "bigint",
+    "int",
+    "smallint",
+    "tinyint",
+    "decimal",
+    "numeric",
+    "float",
+    "real",
+    "money",
+    "smallmoney",
+}
 
 
 def _format_dt(value: datetime | None) -> str | None:
@@ -170,6 +224,166 @@ def _columns_of_with_cursor(cursor: Any, table_name: str) -> set[str]:
     return columns
 
 
+def _column_info_of_with_cursor(cursor: Any, table_name: str) -> dict[str, dict[str, str]]:
+    cursor.execute(
+        """
+        SELECT COLUMN_NAME AS ColumnName, DATA_TYPE AS DataType
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_NAME = %s
+        """,
+        (table_name,),
+    )
+    rows = cursor.fetchall()
+    info: dict[str, dict[str, str]] = {}
+    for row in rows:
+        column_name = str(row.get("ColumnName") or "").strip()
+        if not column_name:
+            continue
+        info[column_name.lower()] = {
+            "name": column_name,
+            "data_type": str(row.get("DataType") or "").strip().lower(),
+        }
+    return info
+
+
+def _tables_of_with_cursor(cursor: Any) -> list[str]:
+    cursor.execute(
+        """
+        SELECT TABLE_NAME AS TableName
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_TYPE = 'BASE TABLE'
+        """
+    )
+    rows = cursor.fetchall()
+    tables: list[str] = []
+    for row in rows:
+        table_name = str(row.get("TableName") or "").strip()
+        if table_name:
+            tables.append(table_name)
+    return tables
+
+
+def _sample_columns_match(
+    cursor: Any,
+    *,
+    table_name: str,
+    left_col: str,
+    right_col: str,
+    sample_size: int = 50,
+) -> bool:
+    if not left_col or not right_col:
+        return False
+
+    sql = f"""
+        SELECT TOP {int(sample_size)}
+            CONVERT(VARCHAR(255), [{left_col}]) AS LeftValue,
+            CONVERT(VARCHAR(255), [{right_col}]) AS RightValue
+        FROM [{table_name}]
+        WHERE [{left_col}] IS NOT NULL
+          AND [{right_col}] IS NOT NULL
+    """
+    cursor.execute(sql)
+    rows = cursor.fetchall()
+    if len(rows) < 5:
+        return False
+
+    for row in rows:
+        left_val = str(row.get("LeftValue") or "").strip()
+        right_val = str(row.get("RightValue") or "").strip()
+        if not left_val or not right_val or left_val != right_val:
+            return False
+    return True
+
+
+def _detect_employee_id_column(
+    cursor: Any,
+    *,
+    employee_columns: set[str],
+) -> tuple[str | None, str]:
+    employee_code_col = _pick_first(employee_columns, _EMPLOYEE_ID_PRIMARY_CANDIDATES)
+    if employee_code_col:
+        return employee_code_col, "EMPLOYEECODE"
+
+    return None, "MISSING_EMPLOYEECODE"
+
+
+def _detect_department_lookup(
+    cursor: Any,
+    *,
+    employee_columns: set[str],
+    employee_column_info: dict[str, dict[str, str]],
+) -> dict[str, str] | None:
+    employee_dept_col = _pick_first(employee_columns, _DEPARTMENT_REF_COLUMN_CANDIDATES)
+    if not employee_dept_col:
+        return None
+
+    dept_meta = employee_column_info.get(employee_dept_col.lower(), {})
+    dept_type = str(dept_meta.get("data_type") or "").lower()
+    if dept_type not in _NUMERIC_SQL_TYPES:
+        # Already a likely textual department name in TEmployee; no lookup required.
+        return None
+
+    all_tables = _tables_of_with_cursor(cursor)
+    lower_to_actual = {table.lower(): table for table in all_tables}
+
+    ordered_candidates: list[str] = []
+    for candidate in _DEPARTMENT_TABLE_NAME_CANDIDATES:
+        actual = lower_to_actual.get(candidate.lower())
+        if actual and actual not in ordered_candidates:
+            ordered_candidates.append(actual)
+
+    for table_name in all_tables:
+        if table_name in ordered_candidates:
+            continue
+        lowered = table_name.lower()
+        if "dept" in lowered or "department" in lowered:
+            ordered_candidates.append(table_name)
+
+    for table_name in ordered_candidates:
+        if table_name.lower() == "temployee":
+            continue
+
+        table_columns = _columns_of_with_cursor(cursor, table_name)
+        if not table_columns:
+            continue
+
+        key_col = _pick_first(
+            table_columns,
+            (
+                employee_dept_col,
+                "DepartmentID",
+                "DeptID",
+                "DepID",
+                "DepartmentNo",
+                "DeptNo",
+                "DepNo",
+                "Department",
+                "Dept",
+            ),
+        )
+        name_col = _pick_first(
+            table_columns,
+            (
+                "DepartmentName",
+                "DeptName",
+                "DepName",
+                "Department",
+                "Dept",
+                "Name",
+                "Description",
+            ),
+        )
+        if key_col and name_col and key_col.lower() != name_col.lower():
+            return {
+                "table": table_name,
+                "key_col": key_col,
+                "name_col": name_col,
+                "employee_col": employee_dept_col,
+            }
+
+    return None
+
+
 def _columns_of(table_name: str) -> set[str]:
     with get_cursor() as cursor:
         return _columns_of_with_cursor(cursor, table_name)
@@ -177,16 +391,34 @@ def _columns_of(table_name: str) -> set[str]:
 
 def _resolve_schema(cursor: Any) -> dict[str, Any]:
     employee_columns = _columns_of_with_cursor(cursor, "TEmployee")
+    employee_column_info = _column_info_of_with_cursor(cursor, "TEmployee")
     event_columns = _columns_of_with_cursor(cursor, "TEvent")
     event_type_columns = _columns_of_with_cursor(cursor, "TEventType")
+    employee_id_col, employee_id_source = _detect_employee_id_column(
+        cursor,
+        employee_columns=employee_columns,
+    )
+    employee_dept_col = _pick_first(employee_columns, _DEPARTMENT_REF_COLUMN_CANDIDATES) or _pick_first(
+        employee_columns,
+        _DEPARTMENT_COLUMN_CANDIDATES,
+    )
+    department_lookup = _detect_department_lookup(
+        cursor,
+        employee_columns=employee_columns,
+        employee_column_info=employee_column_info,
+    )
 
     return {
         "employee_columns": employee_columns,
+        "employee_column_info": employee_column_info,
         "event_columns": event_columns,
         "event_type_columns": event_type_columns,
         "employee_name_col": _pick_first(employee_columns, _NAME_COLUMN_CANDIDATES),
-        "employee_department_col": _pick_first(employee_columns, _DEPARTMENT_COLUMN_CANDIDATES),
-        "employee_emp_id_col": _pick_first(employee_columns, ("EmpID",)) or "EmpID",
+        "employee_department_col": employee_dept_col,
+        "employee_department_lookup": department_lookup,
+        "employee_id_col": employee_id_col,
+        "employee_id_source": employee_id_source,
+        "employee_emp_id_col": _pick_first(employee_columns, ("EmpID",)) or employee_id_col or "EmpID",
         "employee_card_col": _pick_first(employee_columns, ("CardNo",)) or "CardNo",
         "employee_emp_enable_col": _pick_first(employee_columns, ("EmpEnable",)) or "EmpEnable",
         "employee_deleted_col": _pick_first(employee_columns, ("Deleted",)) or "Deleted",
@@ -238,11 +470,48 @@ def _employee_name_expr_for_alias(alias: str, schema: dict[str, Any]) -> str:
     return f"LTRIM(RTRIM(ISNULL(CONVERT(VARCHAR(255), {alias}.[{name_col}]), '')))"
 
 
-def _employee_department_expr_for_alias(alias: str, schema: dict[str, Any]) -> str:
+def _employee_id_col(schema: dict[str, Any]) -> str:
+    value = schema.get("employee_id_col")
+    if not value:
+        return ""
+    return str(value)
+
+
+def _employee_id_expr_for_alias(alias: str, schema: dict[str, Any]) -> str:
+    employee_id_col = _employee_id_col(schema)
+    if not employee_id_col:
+        return "''"
+    return f"LTRIM(RTRIM(ISNULL(CONVERT(VARCHAR(64), {alias}.[{employee_id_col}]), '')))"
+
+
+def _employee_department_select_components(
+    *,
+    employee_alias: str,
+    schema: dict[str, Any],
+    department_alias: str = "dept",
+) -> tuple[str, str]:
     dept_col = schema.get("employee_department_col")
     if not dept_col:
-        return "''"
-    return f"LTRIM(RTRIM(ISNULL(CONVERT(VARCHAR(255), {alias}.[{dept_col}]), '')))"
+        return "''", ""
+
+    lookup = schema.get("employee_department_lookup")
+    if isinstance(lookup, dict):
+        table_name = str(lookup.get("table") or "").strip()
+        key_col = str(lookup.get("key_col") or "").strip()
+        name_col = str(lookup.get("name_col") or "").strip()
+        employee_col = str(lookup.get("employee_col") or dept_col).strip()
+        if table_name and key_col and name_col and employee_col:
+            dept_expr = (
+                f"LTRIM(RTRIM(ISNULL(CONVERT(VARCHAR(255), {department_alias}.[{name_col}]), '')))"
+            )
+            join_sql = (
+                f"LEFT JOIN [{table_name}] {department_alias} "
+                f"ON {employee_alias}.[{employee_col}] = {department_alias}.[{key_col}]"
+            )
+            return dept_expr, join_sql
+
+    dept_expr = f"LTRIM(RTRIM(ISNULL(CONVERT(VARCHAR(255), {employee_alias}.[{dept_col}]), '')))"
+    return dept_expr, ""
 
 
 def _clean_text(value: Any) -> str:
@@ -256,20 +525,37 @@ def _employee_name_or_card(row_name: Any, fallback_card_no: str) -> str:
     return name or fallback_card_no
 
 
-def _normalize_emp_id(value: Any, fallback_card_no: str) -> int | str:
+def _normalize_emp_id(value: Any) -> int | str:
     if value is None:
-        return fallback_card_no
+        return ""
     if isinstance(value, int):
         return value
 
     raw = _clean_text(value)
     if not raw:
-        return fallback_card_no
+        return ""
 
     try:
         return int(raw)
     except ValueError:
         return raw
+
+
+def _log_employee_sample_once(employees: Sequence[dict[str, Any]]) -> None:
+    global _EMPLOYEE_SAMPLE_LOGGED
+    if _EMPLOYEE_SAMPLE_LOGGED or not employees:
+        return
+
+    sample = dict(employees[0])
+    schema = _get_schema()
+    logger.info(
+        "Employee sample fields resolved: card_no=%s employee_id=%s department=%s source=%s",
+        _clean_text(sample.get("card_no")) or "-",
+        _clean_text(sample.get("employee_id") if sample.get("employee_id") is not None else sample.get("emp_id")) or "-",
+        _clean_text(sample.get("department")) or "-",
+        _clean_text(schema.get("employee_id_source")) or "-",
+    )
+    _EMPLOYEE_SAMPLE_LOGGED = True
 
 
 def _entry_exit_case(expr: str) -> str:
@@ -390,19 +676,24 @@ def _detect_event_variant(
 
 def _fetch_employee_identity(card_no: str) -> Dict[str, Any]:
     schema = _get_schema()
-    employee_emp_id_col = schema["employee_emp_id_col"] or "EmpID"
+    employee_id_expr = _employee_id_expr_for_alias("emp", schema)
     employee_card_col = schema["employee_card_col"] or "CardNo"
     active_where = _active_employee_where("emp", schema)
     employee_name_expr = _employee_name_expr_for_alias("emp", schema)
-    department_expr = _employee_department_expr_for_alias("emp", schema)
+    department_expr, department_join_sql = _employee_department_select_components(
+        employee_alias="emp",
+        schema=schema,
+        department_alias="dept",
+    )
 
     sql = f"""
         SELECT TOP 1
-            emp.[{employee_emp_id_col}] AS EmpID,
+            {employee_id_expr} AS EmployeeID,
             CONVERT(VARCHAR(64), emp.[{employee_card_col}]) AS CardNo,
             {employee_name_expr} AS EmployeeName,
             {department_expr} AS Department
-        FROM [TEmployee] emp
+        FROM [dbo].[TEmployee] emp
+        {department_join_sql}
         WHERE {active_where}
           AND CONVERT(VARCHAR(64), emp.[{employee_card_col}]) = %s
         ORDER BY EmployeeName, CardNo
@@ -414,11 +705,12 @@ def _fetch_employee_identity(card_no: str) -> Dict[str, Any]:
 
     normalized_card_no = _clean_text(row.get("CardNo")) or card_no
     employee_name = _employee_name_or_card(row.get("EmployeeName"), normalized_card_no)
-    emp_id = _normalize_emp_id(row.get("EmpID"), normalized_card_no)
+    employee_id = _normalize_emp_id(row.get("EmployeeID"))
     department = _clean_text(row.get("Department")) or None
 
     return {
-        "emp_id": emp_id,
+        "emp_id": employee_id,
+        "employee_id": employee_id,
         "card_no": normalized_card_no,
         "employee_name": employee_name,
         "department": department,
@@ -427,17 +719,24 @@ def _fetch_employee_identity(card_no: str) -> Dict[str, Any]:
 
 def fetch_employees(search: str) -> List[Dict[str, Any]]:
     schema = _get_schema()
-    employee_emp_id_col = schema["employee_emp_id_col"] or "EmpID"
+    employee_id_expr = _employee_id_expr_for_alias("emp", schema)
     employee_card_col = schema["employee_card_col"] or "CardNo"
     active_where = _active_employee_where("emp", schema)
     employee_name_expr = _employee_name_expr_for_alias("emp", schema)
+    department_expr, department_join_sql = _employee_department_select_components(
+        employee_alias="emp",
+        schema=schema,
+        department_alias="dept",
+    )
 
     sql = f"""
         SELECT TOP 200
-            emp.[{employee_emp_id_col}] AS EmpID,
+            {employee_id_expr} AS EmployeeID,
             CONVERT(VARCHAR(64), emp.[{employee_card_col}]) AS CardNo,
-            {employee_name_expr} AS EmployeeName
-        FROM [TEmployee] emp
+            {employee_name_expr} AS EmployeeName,
+            {department_expr} AS Department
+        FROM [dbo].[TEmployee] emp
+        {department_join_sql}
         WHERE {active_where}
     """
 
@@ -448,9 +747,10 @@ def fetch_employees(search: str) -> List[Dict[str, Any]]:
           AND (
               {employee_name_expr} LIKE %s
               OR CONVERT(VARCHAR(64), emp.[{employee_card_col}]) LIKE %s
+              OR {employee_id_expr} LIKE %s
           )
         """
-        params = (wildcard, wildcard)
+        params = (wildcard, wildcard, wildcard)
 
     sql += """
         ORDER BY EmployeeName, CardNo
@@ -466,18 +766,472 @@ def fetch_employees(search: str) -> List[Dict[str, Any]]:
         if not card_no:
             continue
         employee_name = _employee_name_or_card(row.get("EmployeeName"), card_no)
-        emp_id = _normalize_emp_id(row.get("EmpID"), card_no)
+        employee_id = _normalize_emp_id(row.get("EmployeeID"))
+        department = _clean_text(row.get("Department")) or None
         employees.append(
             {
-                "emp_id": emp_id,
+                "emp_id": employee_id,
+                "employee_id": employee_id,
                 "card_no": card_no,
                 "employee_name": employee_name,
+                "department": department,
             }
         )
 
+    _log_employee_sample_once(employees)
     return employees
 
 
+def _fetch_all_active_employees() -> list[dict[str, Any]]:
+    schema = _get_schema()
+    employee_id_expr = _employee_id_expr_for_alias("emp", schema)
+    employee_card_col = schema["employee_card_col"] or "CardNo"
+    active_where = _active_employee_where("emp", schema)
+    employee_name_expr = _employee_name_expr_for_alias("emp", schema)
+    department_expr, department_join_sql = _employee_department_select_components(
+        employee_alias="emp",
+        schema=schema,
+        department_alias="dept",
+    )
+
+    sql = f"""
+        SELECT
+            {employee_id_expr} AS EmployeeID,
+            CONVERT(VARCHAR(64), emp.[{employee_card_col}]) AS CardNo,
+            {employee_name_expr} AS EmployeeName,
+            {department_expr} AS Department
+        FROM [dbo].[TEmployee] emp
+        {department_join_sql}
+        WHERE {active_where}
+        ORDER BY EmployeeName, CardNo
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(sql)
+        rows = cursor.fetchall()
+
+    employees: list[dict[str, Any]] = []
+    for row in rows:
+        card_no = _clean_text(row.get("CardNo"))
+        if not card_no:
+            continue
+        employee_name = _employee_name_or_card(row.get("EmployeeName"), card_no)
+        employee_id = _normalize_emp_id(row.get("EmployeeID"))
+        department = _clean_text(row.get("Department")) or None
+        employees.append(
+            {
+                "emp_id": employee_id,
+                "employee_id": employee_id,
+                "card_no": card_no,
+                "employee_name": employee_name,
+                "department": department,
+            }
+        )
+    return employees
+
+
+def _fetch_all_active_events(
+    *,
+    start: datetime,
+    end: datetime,
+    detector: dict[str, str] | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    schema = _get_schema()
+    event_card_col = schema.get("event_card_col")
+    event_time_col = schema.get("event_time_col")
+    employee_card_col = schema.get("employee_card_col") or "CardNo"
+    if not event_card_col or not event_time_col:
+        return {}
+
+    resolved_detector = detector or _detect_event_variant(event_alias="e", event_type_alias="et")
+    if resolved_detector["variant"] == "UNSUPPORTED":
+        return {}
+
+    active_where = _active_employee_where("emp", schema)
+    sql = f"""
+        SELECT
+            CONVERT(VARCHAR(64), emp.[{employee_card_col}]) AS CardNo,
+            e.[{event_time_col}] AS EventTime,
+            {resolved_detector['inout_expr']} AS InOutFlag
+        FROM [TEvent] e
+        {resolved_detector['join_sql']}
+        INNER JOIN [dbo].[TEmployee] emp
+            ON CONVERT(VARCHAR(64), e.[{event_card_col}]) = CONVERT(VARCHAR(64), emp.[{employee_card_col}])
+        WHERE {active_where}
+          AND e.[{event_time_col}] >= %s
+          AND e.[{event_time_col}] < %s
+        ORDER BY CardNo ASC, e.[{event_time_col}] ASC
+    """
+
+    with get_cursor() as cursor:
+        cursor.execute(sql, (start, end))
+        rows = cursor.fetchall()
+
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        card_no = _clean_text(row.get("CardNo"))
+        event_time = row.get("EventTime")
+        if not card_no or not isinstance(event_time, datetime):
+            continue
+        grouped[card_no].append(
+            {
+                "event_time": event_time,
+                "inout_flag": _normalize_inout_flag(row.get("InOutFlag")),
+            }
+        )
+    return grouped
+
+
+def _build_daily_records_for_period_from_events(
+    *,
+    events: Sequence[dict[str, Any]],
+    start: datetime,
+    end: datetime,
+    swap_applied: bool,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    total_events = len(events)
+    start_idx = 0
+    end_idx = 0
+
+    day_cursor = start
+    while day_cursor < end:
+        day_end = day_cursor + timedelta(days=1)
+        overnight_end = day_end + timedelta(hours=settings.shift_out_cutoff_hours)
+
+        while start_idx < total_events and events[start_idx]["event_time"] < day_cursor:
+            start_idx += 1
+
+        if end_idx < start_idx:
+            end_idx = start_idx
+
+        while end_idx < total_events and events[end_idx]["event_time"] < overnight_end:
+            end_idx += 1
+
+        day_events = events[start_idx:end_idx]
+        day_record = _compute_day_attendance(
+            day_start=day_cursor,
+            day_events=day_events,
+            swap_applied=swap_applied,
+        )
+
+        if day_record["has_relevant_events"]:
+            records.append(_serialize_day_record(day_record))
+
+        day_cursor = day_end
+
+    return records
+
+
+def _compute_period_segment_totals_from_events(
+    *,
+    events: Sequence[dict[str, Any]],
+    start: datetime,
+    end: datetime,
+    swap_applied: bool,
+) -> dict[str, Any]:
+    if end <= start or not events:
+        return {
+            "totalInMinutes": 0,
+            "totalOutMinutes": 0,
+            "totalInHHMM": _minutes_to_hhmm(0),
+            "totalOutHHMM": _minutes_to_hhmm(0),
+            "per_day": {},
+        }
+
+    day_totals: dict[str, dict[str, int]] = {}
+    state: int | None = None
+    segment_start: datetime | None = None
+
+    for event in events:
+        event_time = event.get("event_time")
+        if not isinstance(event_time, datetime):
+            continue
+
+        next_state = _event_state(event, swap_applied)
+        if next_state is None:
+            continue
+
+        if state is None:
+            state = next_state
+            segment_start = event_time
+            continue
+
+        if next_state == state:
+            continue
+
+        if segment_start is not None:
+            _accumulate_segment_minutes(
+                day_totals,
+                state=state,
+                segment_start=segment_start,
+                segment_end=event_time,
+                window_start=start,
+                window_end=end,
+            )
+
+        state = next_state
+        segment_start = event_time
+
+    total_in_minutes = sum(bucket["in_minutes"] for bucket in day_totals.values())
+    total_out_minutes = sum(bucket["out_minutes"] for bucket in day_totals.values())
+
+    return {
+        "totalInMinutes": total_in_minutes,
+        "totalOutMinutes": total_out_minutes,
+        "totalInHHMM": _minutes_to_hhmm(total_in_minutes),
+        "totalOutHHMM": _minutes_to_hhmm(total_out_minutes),
+        "per_day": day_totals,
+    }
+
+
+def _build_daily_transactions_and_intervals_from_events(
+    *,
+    selected_date: date,
+    raw_window_events: Sequence[dict[str, Any]],
+    swap_applied: bool,
+) -> dict[str, Any]:
+    day_start = datetime.combine(selected_date, datetime.min.time())
+    day_end = day_start + timedelta(days=1)
+    window_end = day_end + timedelta(hours=settings.shift_out_cutoff_hours)
+
+    if not raw_window_events:
+        return {
+            "date": day_start.strftime("%Y-%m-%d"),
+            "first_in": None,
+            "last_out": None,
+            "duration_minutes": None,
+            "duration_hhmm": None,
+            "missing_punch": False,
+            "rows": [],
+            "transactions": [],
+            "intervals": [],
+            "total_in_minutes": 0,
+            "total_out_minutes": 0,
+            "total_in": _minutes_to_hhmm(0),
+            "total_out": _minutes_to_hhmm(0),
+            "totalInMinutes": 0,
+            "totalOutMinutes": 0,
+            "totalInHHMM": _minutes_to_hhmm(0),
+            "totalOutHHMM": _minutes_to_hhmm(0),
+            "notes": [],
+        }
+
+    in_scope_events = [
+        event for event in raw_window_events if day_start <= event["event_time"] < window_end
+    ]
+    normalized_events = _normalize_event_sequence(events=in_scope_events, swap_applied=swap_applied)
+
+    if not normalized_events:
+        return {
+            "date": day_start.strftime("%Y-%m-%d"),
+            "first_in": None,
+            "last_out": None,
+            "duration_minutes": None,
+            "duration_hhmm": None,
+            "missing_punch": False,
+            "rows": [],
+            "transactions": [],
+            "intervals": [],
+            "total_in_minutes": 0,
+            "total_out_minutes": 0,
+            "total_in": _minutes_to_hhmm(0),
+            "total_out": _minutes_to_hhmm(0),
+            "totalInMinutes": 0,
+            "totalOutMinutes": 0,
+            "totalInHHMM": _minutes_to_hhmm(0),
+            "totalOutHHMM": _minutes_to_hhmm(0),
+            "notes": [],
+        }
+
+    notes: list[str] = []
+
+    first_in_index: int | None = None
+    for index, event in enumerate(normalized_events):
+        event_time = event["event_time"]
+        if day_start <= event_time < day_end and event["state"] == 1:
+            first_in_index = index
+            break
+
+    out_on_day = [
+        event
+        for event in normalized_events
+        if day_start <= event["event_time"] < day_end and event["state"] == 0
+    ]
+
+    if first_in_index is None:
+        if out_on_day:
+            notes.append("No IN punch found on selected date; OUT-only transactions were ignored.")
+        return {
+            "date": day_start.strftime("%Y-%m-%d"),
+            "first_in": None,
+            "last_out": _format_dt(out_on_day[-1]["event_time"]) if out_on_day else None,
+            "duration_minutes": None,
+            "duration_hhmm": None,
+            "missing_punch": bool(out_on_day),
+            "rows": [],
+            "transactions": [],
+            "intervals": [],
+            "total_in_minutes": 0,
+            "total_out_minutes": 0,
+            "total_in": _minutes_to_hhmm(0),
+            "total_out": _minutes_to_hhmm(0),
+            "totalInMinutes": 0,
+            "totalOutMinutes": 0,
+            "totalInHHMM": _minutes_to_hhmm(0),
+            "totalOutHHMM": _minutes_to_hhmm(0),
+            "notes": notes,
+        }
+
+    first_in_dt = normalized_events[first_in_index]["event_time"]
+    last_out_index: int | None = None
+    for index in range(len(normalized_events) - 1, first_in_index - 1, -1):
+        event = normalized_events[index]
+        if event["event_time"] >= first_in_dt and event["state"] == 0:
+            last_out_index = index
+            break
+
+    sequence_end_index = last_out_index if last_out_index is not None else len(normalized_events) - 1
+    sequence_events = normalized_events[first_in_index : sequence_end_index + 1]
+
+    transactions: list[dict[str, Any]] = []
+    intervals: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+    total_in_minutes = 0
+    total_out_minutes = 0
+    open_in: datetime | None = None
+    last_out_for_break: datetime | None = None
+
+    for event in sequence_events:
+        event_time = event["event_time"]
+        state = int(event["state"])
+        inferred = bool(event["inferred"])
+        event_label = _event_type_label(state)
+
+        transactions.append(
+            {
+                "type": event_label,
+                "time": _format_time_only(event_time),
+                "timestamp": _format_dt(event_time),
+                "inferred": inferred,
+            }
+        )
+
+        if state == 1:
+            if open_in is not None:
+                notes.append(
+                    f"Ignored consecutive IN at {_format_dt(event_time)} while previous IN remained open."
+                )
+                continue
+
+            if last_out_for_break is not None and event_time > last_out_for_break:
+                total_out_minutes += int((event_time - last_out_for_break).total_seconds() // 60)
+                last_out_for_break = None
+
+            open_in = event_time
+            continue
+
+        if open_in is None:
+            notes.append(f"Ignored OUT at {_format_dt(event_time)} without a matching prior IN.")
+            last_out_for_break = event_time
+            continue
+
+        in_minutes = int((event_time - open_in).total_seconds() // 60)
+        if in_minutes >= 0:
+            total_in_minutes += in_minutes
+            intervals.append(
+                {
+                    "date": open_in.strftime("%Y-%m-%d"),
+                    "in": _format_dt(open_in),
+                    "out": _format_dt(event_time),
+                    "in_time": _format_time_only(open_in),
+                    "out_time": _format_time_only(event_time),
+                    "in_duration_minutes": in_minutes,
+                    "in_duration_hhmm": _minutes_to_hhmm(in_minutes),
+                }
+            )
+            rows.append(
+                {
+                    "date": open_in.strftime("%Y-%m-%d"),
+                    "in": _format_time_12h(open_in),
+                    "out": _format_time_12h(event_time),
+                    "duration": _minutes_to_hhmm(in_minutes),
+                    "in_raw": _format_dt(open_in),
+                    "out_raw": _format_dt(event_time),
+                    "duration_minutes": in_minutes,
+                }
+            )
+        else:
+            notes.append(
+                f"Skipped negative IN interval from {_format_dt(open_in)} to {_format_dt(event_time)}."
+            )
+
+        open_in = None
+        last_out_for_break = event_time
+
+    if open_in is not None:
+        notes.append(f"Missing OUT after last IN at {_format_dt(open_in)}; open interval excluded from totals.")
+
+    last_out_dt = normalized_events[last_out_index]["event_time"] if last_out_index is not None else None
+    duration_minutes = _duration_minutes(first_in_dt, last_out_dt)
+    if duration_minutes is None and first_in_dt is not None and last_out_dt is None:
+        notes.append("Missing OUT punch in selected work window.")
+
+    return {
+        "date": day_start.strftime("%Y-%m-%d"),
+        "first_in": _format_dt(first_in_dt),
+        "last_out": _format_dt(last_out_dt),
+        "duration_minutes": duration_minutes,
+        "duration_hhmm": _minutes_to_hhmm(duration_minutes),
+        "missing_punch": (first_in_dt is None) ^ (last_out_dt is None),
+        "rows": rows,
+        "transactions": transactions,
+        "intervals": intervals,
+        "total_in_minutes": total_in_minutes,
+        "total_out_minutes": total_out_minutes,
+        "total_in": _minutes_to_hhmm(total_in_minutes),
+        "total_out": _minutes_to_hhmm(total_out_minutes),
+        "totalInMinutes": total_in_minutes,
+        "totalOutMinutes": total_out_minutes,
+        "totalInHHMM": _minutes_to_hhmm(total_in_minutes),
+        "totalOutHHMM": _minutes_to_hhmm(total_out_minutes),
+        "notes": notes,
+    }
+
+
+def _count_sessions_from_events(
+    *,
+    events: Sequence[dict[str, Any]],
+    window_start: datetime,
+    window_end: datetime,
+    swap_applied: bool,
+) -> int:
+    if not events:
+        return 0
+
+    normalized = _normalize_event_sequence(events=events, swap_applied=swap_applied)
+    sessions = 0
+    open_in: datetime | None = None
+
+    for event in normalized:
+        event_time = event["event_time"]
+        state = int(event["state"])
+        if event_time >= window_end:
+            break
+
+        if state == 1:
+            if open_in is None:
+                open_in = event_time
+            continue
+
+        if open_in is None:
+            continue
+
+        if event_time >= open_in and event_time > window_start and open_in < window_end:
+            sessions += 1
+        open_in = None
+
+    return sessions
 def fetch_dashboard_summary() -> Dict[str, Any]:
     schema = _get_schema()
     employee_card_col = schema.get("employee_card_col") or "CardNo"
@@ -487,7 +1241,7 @@ def fetch_dashboard_summary() -> Dict[str, Any]:
 
     total_sql = f"""
         SELECT COUNT(1) AS TotalEmployees
-        FROM [TEmployee] emp
+        FROM [dbo].[TEmployee] emp
         WHERE {active_where}
     """
 
@@ -532,7 +1286,7 @@ def fetch_dashboard_summary() -> Dict[str, Any]:
                     WHERE CONVERT(VARCHAR(64), e2.[{event_card_col}]) = CONVERT(VARCHAR(64), emp.[{employee_card_col}])
                     ORDER BY e2.[{event_time_col}] DESC
                 ) AS LastInOut
-            FROM [TEmployee] emp
+            FROM [dbo].[TEmployee] emp
             WHERE {active_where}
         ) summary
     """
@@ -700,6 +1454,7 @@ def _fetch_events_for_card(
     schema = _get_schema()
     event_card_col = schema.get("event_card_col")
     event_time_col = schema.get("event_time_col")
+    employee_card_col = schema.get("employee_card_col") or "CardNo"
     if not event_card_col or not event_time_col:
         return []
 
@@ -713,7 +1468,9 @@ def _fetch_events_for_card(
             {resolved_detector['inout_expr']} AS InOutFlag
         FROM [TEvent] e
         {resolved_detector['join_sql']}
-        WHERE CONVERT(VARCHAR(64), e.[{event_card_col}]) = %s
+        INNER JOIN [dbo].[TEmployee] emp
+            ON CONVERT(VARCHAR(64), e.[{event_card_col}]) = CONVERT(VARCHAR(64), emp.[{employee_card_col}])
+        WHERE CONVERT(VARCHAR(64), emp.[{employee_card_col}]) = %s
           AND e.[{event_time_col}] >= %s
           AND e.[{event_time_col}] < %s
         ORDER BY e.[{event_time_col}] ASC
@@ -746,6 +1503,7 @@ def _fetch_last_event_before(
     schema = _get_schema()
     event_card_col = schema.get("event_card_col")
     event_time_col = schema.get("event_time_col")
+    employee_card_col = schema.get("employee_card_col") or "CardNo"
     if not event_card_col or not event_time_col:
         return None
 
@@ -759,7 +1517,9 @@ def _fetch_last_event_before(
             {resolved_detector['inout_expr']} AS InOutFlag
         FROM [TEvent] e
         {resolved_detector['join_sql']}
-        WHERE CONVERT(VARCHAR(64), e.[{event_card_col}]) = %s
+        INNER JOIN [dbo].[TEmployee] emp
+            ON CONVERT(VARCHAR(64), e.[{event_card_col}]) = CONVERT(VARCHAR(64), emp.[{employee_card_col}])
+        WHERE CONVERT(VARCHAR(64), emp.[{employee_card_col}]) = %s
           AND e.[{event_time_col}] < %s
         ORDER BY e.[{event_time_col}] DESC
     """
@@ -844,216 +1604,11 @@ def _build_daily_transactions_and_intervals(
         end=window_end,
         detector=detector,
     )
-    if not raw_window_events:
-        return {
-            "date": day_start.strftime("%Y-%m-%d"),
-            "first_in": None,
-            "last_out": None,
-            "duration_minutes": None,
-            "duration_hhmm": None,
-            "missing_punch": False,
-            "rows": [],
-            "transactions": [],
-            "intervals": [],
-            "total_in_minutes": 0,
-            "total_out_minutes": 0,
-            "total_in": _minutes_to_hhmm(0),
-            "total_out": _minutes_to_hhmm(0),
-            "totalInMinutes": 0,
-            "totalOutMinutes": 0,
-            "totalInHHMM": _minutes_to_hhmm(0),
-            "totalOutHHMM": _minutes_to_hhmm(0),
-            "notes": [],
-        }
-
-    # Daily calculations use selected day through next-day noon to capture night shifts.
-    in_scope_events = [
-        event for event in raw_window_events if day_start <= event["event_time"] < window_end
-    ]
-    normalized_events = _normalize_event_sequence(events=in_scope_events, swap_applied=swap_applied)
-
-    if not normalized_events:
-        return {
-            "date": day_start.strftime("%Y-%m-%d"),
-            "first_in": None,
-            "last_out": None,
-            "duration_minutes": None,
-            "duration_hhmm": None,
-            "missing_punch": False,
-            "rows": [],
-            "transactions": [],
-            "intervals": [],
-            "total_in_minutes": 0,
-            "total_out_minutes": 0,
-            "total_in": _minutes_to_hhmm(0),
-            "total_out": _minutes_to_hhmm(0),
-            "totalInMinutes": 0,
-            "totalOutMinutes": 0,
-            "totalInHHMM": _minutes_to_hhmm(0),
-            "totalOutHHMM": _minutes_to_hhmm(0),
-            "notes": [],
-        }
-
-    notes: list[str] = []
-
-    first_in_index: int | None = None
-    for index, event in enumerate(normalized_events):
-        event_time = event["event_time"]
-        if day_start <= event_time < day_end and event["state"] == 1:
-            first_in_index = index
-            break
-
-    out_on_day = [
-        event
-        for event in normalized_events
-        if day_start <= event["event_time"] < day_end and event["state"] == 0
-    ]
-
-    if first_in_index is None:
-        if out_on_day:
-            notes.append("No IN punch found on selected date; OUT-only transactions were ignored.")
-        return {
-            "date": day_start.strftime("%Y-%m-%d"),
-            "first_in": None,
-            "last_out": _format_dt(out_on_day[-1]["event_time"]) if out_on_day else None,
-            "duration_minutes": None,
-            "duration_hhmm": None,
-            "missing_punch": bool(out_on_day),
-            "rows": [],
-            "transactions": [],
-            "intervals": [],
-            "total_in_minutes": 0,
-            "total_out_minutes": 0,
-            "total_in": _minutes_to_hhmm(0),
-            "total_out": _minutes_to_hhmm(0),
-            "totalInMinutes": 0,
-            "totalOutMinutes": 0,
-            "totalInHHMM": _minutes_to_hhmm(0),
-            "totalOutHHMM": _minutes_to_hhmm(0),
-            "notes": notes,
-        }
-
-    first_in_dt = normalized_events[first_in_index]["event_time"]
-
-    last_out_index: int | None = None
-    for index in range(len(normalized_events) - 1, first_in_index - 1, -1):
-        event = normalized_events[index]
-        if event["event_time"] >= first_in_dt and event["state"] == 0:
-            last_out_index = index
-            break
-
-    sequence_end_index = last_out_index if last_out_index is not None else len(normalized_events) - 1
-    sequence_events = normalized_events[first_in_index : sequence_end_index + 1]
-
-    transactions: list[dict[str, Any]] = []
-    intervals: list[dict[str, Any]] = []
-    rows: list[dict[str, Any]] = []
-    total_in_minutes = 0
-    total_out_minutes = 0
-
-    open_in: datetime | None = None
-    last_out_for_break: datetime | None = None
-
-    for event in sequence_events:
-        event_time = event["event_time"]
-        state = int(event["state"])
-        inferred = bool(event["inferred"])
-        event_label = _event_type_label(state)
-
-        transactions.append(
-            {
-                "type": event_label,
-                "time": _format_time_only(event_time),
-                "timestamp": _format_dt(event_time),
-                "inferred": inferred,
-            }
-        )
-
-        if state == 1:
-            if open_in is not None:
-                # Consecutive IN values often come from repeated scans; keep earliest open IN.
-                notes.append(
-                    f"Ignored consecutive IN at {_format_dt(event_time)} while previous IN remained open."
-                )
-                continue
-
-            if last_out_for_break is not None and event_time > last_out_for_break:
-                total_out_minutes += int((event_time - last_out_for_break).total_seconds() // 60)
-                last_out_for_break = None
-
-            open_in = event_time
-            continue
-
-        if open_in is None:
-            # Leading OUTs are ignored until the first valid IN.
-            notes.append(f"Ignored OUT at {_format_dt(event_time)} without a matching prior IN.")
-            last_out_for_break = event_time
-            continue
-
-        in_minutes = int((event_time - open_in).total_seconds() // 60)
-        if in_minutes >= 0:
-            total_in_minutes += in_minutes
-            intervals.append(
-                {
-                    "date": open_in.strftime("%Y-%m-%d"),
-                    "in": _format_dt(open_in),
-                    "out": _format_dt(event_time),
-                    "in_time": _format_time_only(open_in),
-                    "out_time": _format_time_only(event_time),
-                    "in_duration_minutes": in_minutes,
-                    "in_duration_hhmm": _minutes_to_hhmm(in_minutes),
-                }
-            )
-            rows.append(
-                {
-                    "date": open_in.strftime("%Y-%m-%d"),
-                    "in": _format_time_12h(open_in),
-                    "out": _format_time_12h(event_time),
-                    "duration": _minutes_to_hhmm(in_minutes),
-                    "in_raw": _format_dt(open_in),
-                    "out_raw": _format_dt(event_time),
-                    "duration_minutes": in_minutes,
-                }
-            )
-        else:
-            # Never return negative durations.
-            notes.append(
-                f"Skipped negative IN interval from {_format_dt(open_in)} to {_format_dt(event_time)}."
-            )
-
-        open_in = None
-        last_out_for_break = event_time
-
-    if open_in is not None:
-        notes.append(f"Missing OUT after last IN at {_format_dt(open_in)}; open interval excluded from totals.")
-
-    last_out_dt = (
-        normalized_events[last_out_index]["event_time"] if last_out_index is not None else None
+    return _build_daily_transactions_and_intervals_from_events(
+        selected_date=selected_date,
+        raw_window_events=raw_window_events,
+        swap_applied=swap_applied,
     )
-    duration_minutes = _duration_minutes(first_in_dt, last_out_dt)
-    if duration_minutes is None and first_in_dt is not None and last_out_dt is None:
-        notes.append("Missing OUT punch in selected work window.")
-
-    return {
-        "date": day_start.strftime("%Y-%m-%d"),
-        "first_in": _format_dt(first_in_dt),
-        "last_out": _format_dt(last_out_dt),
-        "duration_minutes": duration_minutes,
-        "duration_hhmm": _minutes_to_hhmm(duration_minutes),
-        "missing_punch": (first_in_dt is None) ^ (last_out_dt is None),
-        "rows": rows,
-        "transactions": transactions,
-        "intervals": intervals,
-        "total_in_minutes": total_in_minutes,
-        "total_out_minutes": total_out_minutes,
-        "total_in": _minutes_to_hhmm(total_in_minutes),
-        "total_out": _minutes_to_hhmm(total_out_minutes),
-        "totalInMinutes": total_in_minutes,
-        "totalOutMinutes": total_out_minutes,
-        "totalInHHMM": _minutes_to_hhmm(total_in_minutes),
-        "totalOutHHMM": _minutes_to_hhmm(total_out_minutes),
-        "notes": notes,
-    }
 
 
 def _accumulate_segment_minutes(
@@ -1537,6 +2092,303 @@ def fetch_yearly_report(card_no: str, year_value: str) -> Dict[str, Any]:
         "totalInHHMM": period_totals["totalInHHMM"],
         "totalOutHHMM": period_totals["totalOutHHMM"],
         "total_work_minutes": total_minutes,
+        "mappingVariant": mapping["mappingVariant"],
+        "swapApplied": mapping["swapApplied"],
+    }
+
+
+def _sorted_employee_rows_for_all(employees: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    return sorted(
+        [dict(item) for item in employees],
+        key=lambda item: (
+            _clean_text(item.get("employee_name")).lower(),
+            _clean_text(item.get("card_no")),
+        ),
+    )
+
+
+def fetch_daily_report_all_employees(date_value: str) -> Dict[str, Any]:
+    selected_date = _parse_date(date_value)
+    detector = _detect_event_variant(event_alias="e", event_type_alias="et")
+    mapping = _get_mapping_state(detector=detector)
+    swap_applied = bool(mapping["swapApplied"])
+
+    employees = _sorted_employee_rows_for_all(_fetch_all_active_employees())
+
+    day_start = datetime.combine(selected_date, datetime.min.time())
+    day_end = day_start + timedelta(days=1)
+    window_start = day_start - timedelta(hours=12)
+    window_end = day_end + timedelta(hours=12)
+    events_by_card = _fetch_all_active_events(start=window_start, end=window_end, detector=detector)
+
+    rows: list[dict[str, Any]] = []
+    total_in_minutes = 0
+    total_out_minutes = 0
+    total_duration_minutes = 0
+    total_sessions = 0
+    working_rows = 0
+    missing_punch_count = 0
+
+    for employee in employees:
+        card_no = str(employee.get("card_no") or "").strip()
+        if not card_no:
+            continue
+
+        daily = _build_daily_transactions_and_intervals_from_events(
+            selected_date=selected_date,
+            raw_window_events=events_by_card.get(card_no, []),
+            swap_applied=swap_applied,
+        )
+        sessions_count = len(daily.get("rows") or [])
+        duration_minutes = _to_int(daily.get("duration_minutes"))
+        in_minutes = _to_int(daily.get("totalInMinutes")) or _to_int(daily.get("total_in_minutes")) or 0
+        out_minutes = _to_int(daily.get("totalOutMinutes")) or _to_int(daily.get("total_out_minutes")) or 0
+        missing_punch = bool(daily.get("missing_punch"))
+
+        if duration_minutes is not None:
+            total_duration_minutes += duration_minutes
+            working_rows += 1
+        if missing_punch:
+            missing_punch_count += 1
+
+        total_in_minutes += max(0, in_minutes)
+        total_out_minutes += max(0, out_minutes)
+        total_sessions += max(0, sessions_count)
+
+        rows.append(
+            {
+                "employee_name": employee.get("employee_name") or card_no,
+                "card_no": card_no,
+                "department": employee.get("department"),
+                "first_in": daily.get("first_in"),
+                "last_out": daily.get("last_out"),
+                "duration_minutes": duration_minutes,
+                "duration_hhmm": daily.get("duration_hhmm"),
+                "total_in_minutes": in_minutes,
+                "total_out_minutes": out_minutes,
+                "total_in_hhmm": daily.get("totalInHHMM") or daily.get("total_in"),
+                "total_out_hhmm": daily.get("totalOutHHMM") or daily.get("total_out"),
+                "sessions_count": sessions_count,
+                "missing_punch": missing_punch,
+            }
+        )
+
+    return {
+        "date": selected_date.strftime("%Y-%m-%d"),
+        "rows": rows,
+        "summary": {
+            "total_employees": len(employees),
+            "total_working_days": working_rows,
+            "total_in_minutes": total_in_minutes,
+            "total_out_minutes": total_out_minutes,
+            "total_duration_minutes": total_duration_minutes,
+            "total_sessions": total_sessions,
+            "missing_punch_count": missing_punch_count,
+            "total_in_hhmm": _minutes_to_hhmm(total_in_minutes),
+            "total_out_hhmm": _minutes_to_hhmm(total_out_minutes),
+            "total_duration_hhmm": _minutes_to_hhmm(total_duration_minutes),
+            "total_duration_readable": format_duration_readable(total_duration_minutes),
+        },
+        "mappingVariant": mapping["mappingVariant"],
+        "swapApplied": mapping["swapApplied"],
+    }
+
+
+def fetch_monthly_report_all_employees(month_value: str) -> Dict[str, Any]:
+    start, end, normalized_month = _month_bounds(month_value)
+    detector = _detect_event_variant(event_alias="e", event_type_alias="et")
+    mapping = _get_mapping_state(detector=detector)
+    swap_applied = bool(mapping["swapApplied"])
+
+    employees = _sorted_employee_rows_for_all(_fetch_all_active_employees())
+    window_start = start - timedelta(hours=12)
+    window_end = end + timedelta(days=1, hours=settings.shift_out_cutoff_hours)
+    events_by_card = _fetch_all_active_events(start=window_start, end=window_end, detector=detector)
+
+    rows: list[dict[str, Any]] = []
+    total_in_minutes = 0
+    total_out_minutes = 0
+    total_work_minutes = 0
+    total_working_days = 0
+    total_missing_punch = 0
+    total_sessions = 0
+
+    for employee in employees:
+        card_no = str(employee.get("card_no") or "").strip()
+        if not card_no:
+            continue
+
+        events = events_by_card.get(card_no, [])
+        records = _build_daily_records_for_period_from_events(
+            events=events,
+            start=start,
+            end=end,
+            swap_applied=swap_applied,
+        )
+        period_totals = _compute_period_segment_totals_from_events(
+            events=events,
+            start=start,
+            end=end,
+            swap_applied=swap_applied,
+        )
+        sessions = _count_sessions_from_events(
+            events=events,
+            window_start=start,
+            window_end=end + timedelta(hours=settings.shift_out_cutoff_hours),
+            swap_applied=swap_applied,
+        )
+
+        working_days = sum(1 for item in records if item.get("first_in"))
+        missing_punch_days = sum(1 for item in records if bool(item.get("missing_punch")))
+        total_minutes = sum(_to_int(item.get("duration_minutes")) or 0 for item in records)
+        average_minutes = int(total_minutes / working_days) if working_days > 0 else 0
+
+        in_minutes = _to_int(period_totals.get("totalInMinutes")) or 0
+        out_minutes = _to_int(period_totals.get("totalOutMinutes")) or 0
+
+        total_working_days += working_days
+        total_missing_punch += missing_punch_days
+        total_work_minutes += total_minutes
+        total_in_minutes += in_minutes
+        total_out_minutes += out_minutes
+        total_sessions += max(0, sessions)
+
+        rows.append(
+            {
+                "employee_name": employee.get("employee_name") or card_no,
+                "card_no": card_no,
+                "department": employee.get("department"),
+                "working_days": working_days,
+                "total_minutes": total_minutes,
+                "total_duration_hhmm": _minutes_to_hhmm(total_minutes),
+                "total_duration_readable": format_duration_readable(total_minutes),
+                "avg_minutes_per_day": average_minutes,
+                "avg_duration_hhmm": _minutes_to_hhmm(average_minutes),
+                "missing_punch_days": missing_punch_days,
+                "sessions_count": sessions,
+                "total_in_minutes": in_minutes,
+                "total_out_minutes": out_minutes,
+                "total_in_hhmm": period_totals.get("totalInHHMM"),
+                "total_out_hhmm": period_totals.get("totalOutHHMM"),
+            }
+        )
+
+    return {
+        "month": normalized_month,
+        "rows": rows,
+        "summary": {
+            "total_employees": len(employees),
+            "total_working_days": total_working_days,
+            "total_in_minutes": total_in_minutes,
+            "total_out_minutes": total_out_minutes,
+            "total_work_minutes": total_work_minutes,
+            "total_sessions": total_sessions,
+            "missing_punch_count": total_missing_punch,
+            "total_in_hhmm": _minutes_to_hhmm(total_in_minutes),
+            "total_out_hhmm": _minutes_to_hhmm(total_out_minutes),
+            "total_work_hhmm": _minutes_to_hhmm(total_work_minutes),
+            "total_work_readable": format_duration_readable(total_work_minutes),
+        },
+        "mappingVariant": mapping["mappingVariant"],
+        "swapApplied": mapping["swapApplied"],
+    }
+
+
+def fetch_yearly_report_all_employees(year_value: str) -> Dict[str, Any]:
+    start, end, normalized_year = _year_bounds(year_value)
+    detector = _detect_event_variant(event_alias="e", event_type_alias="et")
+    mapping = _get_mapping_state(detector=detector)
+    swap_applied = bool(mapping["swapApplied"])
+
+    employees = _sorted_employee_rows_for_all(_fetch_all_active_employees())
+    window_start = start - timedelta(hours=12)
+    window_end = end + timedelta(days=1, hours=settings.shift_out_cutoff_hours)
+    events_by_card = _fetch_all_active_events(start=window_start, end=window_end, detector=detector)
+
+    rows: list[dict[str, Any]] = []
+    total_in_minutes = 0
+    total_out_minutes = 0
+    total_work_minutes = 0
+    total_working_days = 0
+    total_missing_punch = 0
+    total_sessions = 0
+
+    for employee in employees:
+        card_no = str(employee.get("card_no") or "").strip()
+        if not card_no:
+            continue
+
+        events = events_by_card.get(card_no, [])
+        records = _build_daily_records_for_period_from_events(
+            events=events,
+            start=start,
+            end=end,
+            swap_applied=swap_applied,
+        )
+        period_totals = _compute_period_segment_totals_from_events(
+            events=events,
+            start=start,
+            end=end,
+            swap_applied=swap_applied,
+        )
+        sessions = _count_sessions_from_events(
+            events=events,
+            window_start=start,
+            window_end=end + timedelta(hours=settings.shift_out_cutoff_hours),
+            swap_applied=swap_applied,
+        )
+
+        working_days = sum(1 for item in records if item.get("first_in"))
+        missing_punch_days = sum(1 for item in records if bool(item.get("missing_punch")))
+        total_minutes = sum(_to_int(item.get("duration_minutes")) or 0 for item in records)
+        average_minutes = int(total_minutes / working_days) if working_days > 0 else 0
+
+        in_minutes = _to_int(period_totals.get("totalInMinutes")) or 0
+        out_minutes = _to_int(period_totals.get("totalOutMinutes")) or 0
+
+        total_working_days += working_days
+        total_missing_punch += missing_punch_days
+        total_work_minutes += total_minutes
+        total_in_minutes += in_minutes
+        total_out_minutes += out_minutes
+        total_sessions += max(0, sessions)
+
+        rows.append(
+            {
+                "employee_name": employee.get("employee_name") or card_no,
+                "card_no": card_no,
+                "department": employee.get("department"),
+                "working_days": working_days,
+                "total_minutes": total_minutes,
+                "total_duration_hhmm": _minutes_to_hhmm(total_minutes),
+                "total_duration_readable": format_duration_readable(total_minutes),
+                "avg_minutes_per_day": average_minutes,
+                "avg_duration_hhmm": _minutes_to_hhmm(average_minutes),
+                "missing_punch_days": missing_punch_days,
+                "sessions_count": sessions,
+                "total_in_minutes": in_minutes,
+                "total_out_minutes": out_minutes,
+                "total_in_hhmm": period_totals.get("totalInHHMM"),
+                "total_out_hhmm": period_totals.get("totalOutHHMM"),
+            }
+        )
+
+    return {
+        "year": normalized_year,
+        "rows": rows,
+        "summary": {
+            "total_employees": len(employees),
+            "total_working_days": total_working_days,
+            "total_in_minutes": total_in_minutes,
+            "total_out_minutes": total_out_minutes,
+            "total_work_minutes": total_work_minutes,
+            "total_sessions": total_sessions,
+            "missing_punch_count": total_missing_punch,
+            "total_in_hhmm": _minutes_to_hhmm(total_in_minutes),
+            "total_out_hhmm": _minutes_to_hhmm(total_out_minutes),
+            "total_work_hhmm": _minutes_to_hhmm(total_work_minutes),
+            "total_work_readable": format_duration_readable(total_work_minutes),
+        },
         "mappingVariant": mapping["mappingVariant"],
         "swapApplied": mapping["swapApplied"],
     }

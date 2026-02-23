@@ -17,8 +17,10 @@ type AuthMe = {
 
 type Employee = {
   emp_id: number | string;
+  employee_id?: number | string;
   card_no: string;
   employee_name: string;
+  department?: string | null;
 };
 
 type DailyReport = {
@@ -581,11 +583,18 @@ export default function DashboardClient() {
 
   const selectedEmployee = employees.find((employee) => employee.card_no === selectedCardNo);
   const selectedDepartment =
-    tab === "daily"
+    String(selectedEmployee?.department ?? "").trim() ||
+    (tab === "daily"
       ? dailyReport?.department
       : tab === "monthly"
       ? monthlyReport?.department
-      : yearlyReport?.department;
+      : yearlyReport?.department);
+  const selectedEmployeeId = String(selectedEmployee?.employee_id ?? selectedEmployee?.emp_id ?? "").trim();
+  const selectedEmployeeMeta = [
+    selectedEmployeeId ? `EmpID: ${selectedEmployeeId}` : "",
+    selectedDepartment ? selectedDepartment : "",
+    selectedEmployee?.card_no ? selectedEmployee.card_no : ""
+  ].filter(Boolean);
 
   async function saveEmployeeSetting() {
     if (!selectedCardNo || !selectedEmployee) {
@@ -870,13 +879,22 @@ export default function DashboardClient() {
           <input
             value={search}
             onChange={(event) => setSearch(event.target.value)}
-            placeholder="Search by name or CardNo"
+            placeholder="Search by Name, Card No or EmpID"
             className="mb-3 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none transition focus:border-cyan-400"
           />
 
           <div className="max-h-[65vh] space-y-2 overflow-y-auto pr-1 table-scroll">
             {employees.map((employee) => {
               const active = employee.card_no === selectedCardNo;
+              const employeeId = String(employee.employee_id ?? employee.emp_id ?? "").trim();
+              const department = String(employee.department ?? "").trim();
+              const detailParts = [employee.card_no];
+              if (employeeId) {
+                detailParts.push(`EmpID: ${employeeId}`);
+              }
+              if (department) {
+                detailParts.push(department);
+              }
               return (
                 <button
                   key={`${employee.emp_id}-${employee.card_no}`}
@@ -889,7 +907,7 @@ export default function DashboardClient() {
                   }`}
                 >
                   <p className="font-medium leading-tight">{employee.employee_name}</p>
-                  <p className={`mt-1 text-xs ${active ? "text-cyan-200/80" : "text-zinc-500"}`}>{employee.card_no}</p>
+                  <p className={`mt-1 text-xs ${active ? "text-cyan-200/80" : "text-zinc-500"}`}>{detailParts.join(" • ")}</p>
                 </button>
               );
             })}
@@ -906,8 +924,7 @@ export default function DashboardClient() {
               <h2 className="mt-1 text-xl font-medium text-zinc-100">
                 {selectedEmployee?.employee_name ?? dailyReport?.employee_name ?? "None"}
               </h2>
-              {selectedEmployee?.card_no ? <p className="mt-1 text-sm text-zinc-400">{selectedEmployee.card_no}</p> : null}
-              {selectedDepartment && section === "reports" ? <p className="mt-1 text-sm text-zinc-500">{selectedDepartment}</p> : null}
+              {selectedEmployeeMeta.length ? <p className="mt-1 text-sm text-zinc-400">{selectedEmployeeMeta.join(" • ")}</p> : null}
               {me ? <p className="mt-1 text-xs text-zinc-500">Logged in as {me.username}</p> : null}
             </div>
 

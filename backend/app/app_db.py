@@ -19,6 +19,24 @@ from .security import (
 
 logger = logging.getLogger(__name__)
 _warned_plain_smtp = False
+VALID_USER_ROLES = {"admin", "inspector"}
+
+
+def _normalize_role(value: str | None) -> str:
+    role = str(value or "").strip().lower()
+    if role == "hr":
+        return "inspector"
+    if role in VALID_USER_ROLES:
+        return role
+    raise ValueError("role must be one of: admin, inspector")
+
+
+def _normalize_user_payload(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    raw_role = str(normalized.get("role") or "").strip().lower()
+    normalized["role"] = "inspector" if raw_role == "hr" else raw_role
+    normalized["is_active"] = bool(normalized.get("is_active"))
+    return normalized
 
 
 def _dict_from_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -54,7 +72,7 @@ def init_app_db() -> None:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 email TEXT NOT NULL UNIQUE,
                 username TEXT NOT NULL UNIQUE,
-                role TEXT NOT NULL CHECK(role IN ('admin', 'hr')),
+                role TEXT NOT NULL CHECK(role IN ('admin', 'inspector')),
                 password_hash TEXT NOT NULL,
                 is_active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
@@ -119,8 +137,78 @@ def init_app_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_notifications_log_date ON notifications_log(date);
             """
         )
+        _migrate_users_role_schema(conn)
+        _normalize_legacy_roles(conn)
 
     ensure_default_admin_user()
+
+
+def _normalize_sql(sql: str) -> str:
+    return " ".join(sql.lower().split())
+
+
+def _migrate_users_role_schema(conn: sqlite3.Connection) -> None:
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+    ).fetchone()
+    if not row:
+        return
+
+    table_sql = str(row["sql"] or "")
+    normalized_sql = _normalize_sql(table_sql)
+    if "check(role in ('admin', 'inspector'))" in normalized_sql:
+        return
+
+    # Recreate users table to update role check constraint and normalize legacy roles.
+    conn.executescript(
+        """
+        PRAGMA foreign_keys = OFF;
+
+        CREATE TABLE IF NOT EXISTS users_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL UNIQUE,
+            username TEXT NOT NULL UNIQUE,
+            role TEXT NOT NULL CHECK(role IN ('admin', 'inspector')),
+            password_hash TEXT NOT NULL,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_login_at TEXT NULL
+        );
+
+        INSERT INTO users_new (id, email, username, role, password_hash, is_active, created_at, updated_at, last_login_at)
+        SELECT
+            id,
+            email,
+            username,
+            CASE
+                WHEN lower(role) = 'admin' THEN 'admin'
+                WHEN lower(role) = 'hr' THEN 'inspector'
+                WHEN lower(role) = 'inspector' THEN 'inspector'
+                ELSE 'inspector'
+            END AS role,
+            password_hash,
+            is_active,
+            created_at,
+            updated_at,
+            last_login_at
+        FROM users;
+
+        DROP TABLE users;
+        ALTER TABLE users_new RENAME TO users;
+        CREATE INDEX IF NOT EXISTS idx_users_role ON users(role);
+
+        PRAGMA foreign_keys = ON;
+        """
+    )
+
+
+def _normalize_legacy_roles(conn: sqlite3.Connection) -> None:
+    now = utc_now_iso()
+    conn.execute(
+        "UPDATE users SET role = 'inspector', updated_at = ? WHERE lower(role) = 'hr'",
+        (now,),
+    )
 
 
 def ensure_default_admin_user() -> None:
@@ -165,7 +253,10 @@ def get_user_by_login(login: str) -> dict[str, Any] | None:
             (normalized, normalized),
         ).fetchone()
 
-    return _dict_from_row(row)
+    payload = _dict_from_row(row)
+    if not payload:
+        return None
+    return _normalize_user_payload(payload)
 
 
 def get_user_by_id(user_id: int) -> dict[str, Any] | None:
@@ -180,7 +271,10 @@ def get_user_by_id(user_id: int) -> dict[str, Any] | None:
             (user_id,),
         ).fetchone()
 
-    return _dict_from_row(row)
+    payload = _dict_from_row(row)
+    if not payload:
+        return None
+    return _normalize_user_payload(payload)
 
 
 def touch_user_login(user_id: int) -> None:
@@ -192,23 +286,31 @@ def touch_user_login(user_id: int) -> None:
         )
 
 
-def list_hr_users() -> list[dict[str, Any]]:
+def list_users() -> list[dict[str, Any]]:
     with get_app_db() as conn:
         rows = conn.execute(
             """
             SELECT id, email, username, role, is_active, created_at, updated_at, last_login_at
             FROM users
-            WHERE role = 'hr'
-            ORDER BY username COLLATE NOCASE ASC
+            ORDER BY
+                CASE WHEN role = 'admin' THEN 0 ELSE 1 END,
+                username COLLATE NOCASE ASC
             """
         ).fetchall()
 
-    return [_dict_from_row(row) for row in rows if row is not None]
+    result: list[dict[str, Any]] = []
+    for row in rows:
+        payload = _dict_from_row(row)
+        if payload is None:
+            continue
+        result.append(_normalize_user_payload(payload))
+    return result
 
 
-def create_hr_user(email: str, username: str, password: str) -> dict[str, Any]:
+def create_user(*, email: str, username: str, password: str, role: str) -> dict[str, Any]:
     normalized_email = email.strip().lower()
     normalized_username = username.strip()
+    normalized_role = _normalize_role(role)
     if not normalized_email or not normalized_username:
         raise ValueError("email and username are required")
 
@@ -224,9 +326,9 @@ def create_hr_user(email: str, username: str, password: str) -> dict[str, Any]:
         cursor = conn.execute(
             """
             INSERT INTO users (email, username, role, password_hash, is_active, created_at, updated_at)
-            VALUES (?, ?, 'hr', ?, 1, ?, ?)
+            VALUES (?, ?, ?, ?, 1, ?, ?)
             """,
-            (normalized_email, normalized_username, hash_password(password), now, now),
+            (normalized_email, normalized_username, normalized_role, hash_password(password), now, now),
         )
         user_id = int(cursor.lastrowid)
 
@@ -236,11 +338,87 @@ def create_hr_user(email: str, username: str, password: str) -> dict[str, Any]:
     return user
 
 
+def update_user(
+    *,
+    user_id: int,
+    email: str | None = None,
+    password: str | None = None,
+    role: str | None = None,
+    is_active: bool | None = None,
+) -> dict[str, Any]:
+    existing = get_user_by_id(user_id)
+    if not existing:
+        raise ValueError("user not found")
+
+    normalized_email = str(existing.get("email") or "").strip().lower()
+    if email is not None:
+        normalized_email = email.strip().lower()
+        if not normalized_email:
+            raise ValueError("email is required")
+
+    normalized_role = str(existing.get("role") or "inspector")
+    if role is not None:
+        normalized_role = _normalize_role(role)
+
+    active_value = 1 if bool(existing.get("is_active")) else 0
+    if is_active is not None:
+        active_value = 1 if is_active else 0
+
+    now = utc_now_iso()
+    with get_app_db() as conn:
+        duplicate = conn.execute(
+            "SELECT id FROM users WHERE lower(email) = lower(?) AND id <> ? LIMIT 1",
+            (normalized_email, user_id),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("user with same email already exists")
+
+        params: list[Any] = [normalized_email, normalized_role, active_value, now]
+        sql = "UPDATE users SET email = ?, role = ?, is_active = ?, updated_at = ?"
+        if password is not None:
+            sql += ", password_hash = ?"
+            params.append(hash_password(password))
+        sql += " WHERE id = ?"
+        params.append(user_id)
+        conn.execute(sql, tuple(params))
+
+    user = get_user_by_id(user_id)
+    if not user:
+        raise ValueError("user not found")
+    return user
+
+
+def delete_user(user_id: int) -> None:
+    with get_app_db() as conn:
+        conn.execute("DELETE FROM password_resets WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+
+
+def count_active_admin_users() -> int:
+    with get_app_db() as conn:
+        row = conn.execute(
+            "SELECT COUNT(1) AS cnt FROM users WHERE role = 'admin' AND is_active = 1"
+        ).fetchone()
+    if not row:
+        return 0
+    return int(row["cnt"] or 0)
+
+
+def list_hr_users() -> list[dict[str, Any]]:
+    # Backward-compatible helper for legacy endpoints.
+    return [user for user in list_users() if user.get("role") == "inspector"]
+
+
+def create_hr_user(email: str, username: str, password: str) -> dict[str, Any]:
+    # Backward-compatible helper for legacy endpoints.
+    return create_user(email=email, username=username, password=password, role="inspector")
+
+
 def set_user_active(user_id: int, is_active: bool) -> None:
     now = utc_now_iso()
     with get_app_db() as conn:
         conn.execute(
-            "UPDATE users SET is_active = ?, updated_at = ? WHERE id = ? AND role = 'hr'",
+            "UPDATE users SET is_active = ?, updated_at = ? WHERE id = ?",
             (1 if is_active else 0, now, user_id),
         )
 
@@ -335,7 +513,7 @@ def get_smtp_settings(include_password: bool = False) -> dict[str, Any]:
             "username": "",
             "password": "" if include_password else None,
             "from_email": "",
-            "from_name": "Oilchem HR Admin",
+            "from_name": "Oilchem Entry/Exit Admin",
             "use_tls": True,
             "use_ssl": False,
             "cc_list": "",
@@ -351,7 +529,7 @@ def get_smtp_settings(include_password: bool = False) -> dict[str, Any]:
         "username": (payload.get("username") or "").strip(),
         "password": decrypted_password if include_password else None,
         "from_email": (payload.get("from_email") or "").strip(),
-        "from_name": (payload.get("from_name") or "Oilchem HR Admin").strip() or "Oilchem HR Admin",
+        "from_name": (payload.get("from_name") or "Oilchem Entry/Exit Admin").strip() or "Oilchem Entry/Exit Admin",
         "use_tls": bool(payload.get("use_tls")),
         "use_ssl": bool(payload.get("use_ssl")),
         "cc_list": (payload.get("cc_list") or "").strip(),
@@ -367,7 +545,7 @@ def upsert_smtp_settings(data: dict[str, Any]) -> None:
     username = str(data.get("username") or "").strip()
     password = str(data.get("password") or "")
     from_email = str(data.get("from_email") or "").strip()
-    from_name = str(data.get("from_name") or "Oilchem HR Admin").strip() or "Oilchem HR Admin"
+    from_name = str(data.get("from_name") or "Oilchem Entry/Exit Admin").strip() or "Oilchem Entry/Exit Admin"
     use_tls = 1 if data.get("use_tls") else 0
     use_ssl = 1 if data.get("use_ssl") else 0
     cc_list = str(data.get("cc_list") or "").strip()

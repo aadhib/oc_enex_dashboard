@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation";
 
 export type AuthUser = {
   id: number;
-  role: "admin" | "hr";
+  role: "admin" | "inspector";
   username: string;
   email: string;
 };

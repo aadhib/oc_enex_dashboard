@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -28,8 +28,10 @@ class AuthMeResponse(BaseModel):
 
 class EmployeeItem(BaseModel):
     emp_id: int | str
+    employee_id: int | str
     card_no: str
     employee_name: str
+    department: Optional[str] = None
 
 
 class EmployeesResponse(BaseModel):
@@ -138,7 +140,7 @@ class SMTPSettingsRequest(BaseModel):
     username: str = Field(default="", max_length=255)
     password: str = Field(default="", max_length=512)
     from_email: str = Field(default="", max_length=255)
-    from_name: str = Field(default="Oilchem Attendance Admin", max_length=255)
+    from_name: str = Field(default="Oilchem Entry/Exit Admin", max_length=255)
     use_tls: bool = True
     use_ssl: bool = False
     cc_list: str = Field(default="", max_length=2000)
@@ -183,6 +185,35 @@ class UpdateUserActiveRequest(BaseModel):
 
 class SetTempPasswordRequest(BaseModel):
     temp_password: str = Field(min_length=8, max_length=256)
+
+
+class UserItem(BaseModel):
+    id: int
+    email: str
+    username: str
+    role: Literal["admin", "inspector"]
+    is_active: bool
+    created_at: str
+    updated_at: str
+    last_login_at: Optional[str]
+
+
+class UsersResponse(BaseModel):
+    users: List[UserItem]
+
+
+class CreateUserRequest(BaseModel):
+    username: str = Field(min_length=1, max_length=128)
+    email: str = Field(min_length=5, max_length=255)
+    password: str = Field(min_length=8, max_length=256)
+    role: Literal["admin", "inspector"] = "inspector"
+
+
+class UpdateUserRequest(BaseModel):
+    email: Optional[str] = Field(default=None, min_length=5, max_length=255)
+    password: Optional[str] = Field(default=None, min_length=8, max_length=256)
+    role: Optional[Literal["admin", "inspector"]] = None
+    is_active: Optional[bool] = None
 
 
 class ResetLinkResponse(BaseModel):

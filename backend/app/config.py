@@ -85,6 +85,7 @@ def get_settings() -> Settings:
         allow_origins=_split_csv(
             os.getenv("ALLOW_ORIGIN"),
             [
+                "https://dash.hse-oilchem.com",
                 "https://admin.hse-oilchem.com",
                 "http://localhost:3000",
             ],

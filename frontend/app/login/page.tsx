@@ -59,7 +59,7 @@ export default function LoginPage() {
         </div>
 
         <p className="text-center text-xs uppercase tracking-[0.25em] text-zinc-400">OILCHEM</p>
-        <h1 className="mt-3 text-center text-3xl font-semibold text-zinc-100">Entry & Exit Dashboard</h1>
+        <h1 className="mt-3 text-center text-3xl font-semibold text-zinc-100">Entry/Exit Dashboard</h1>
         <p className="mt-2 text-center text-sm text-zinc-400">Please sign in using your authorized credentials</p>
 
         <form className="mt-6 space-y-4" onSubmit={handleSubmit}>

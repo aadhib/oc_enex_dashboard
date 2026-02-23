@@ -18,7 +18,7 @@ class AuthUser(TypedDict):
     id: int
     email: str
     username: str
-    role: Literal["admin", "hr"]
+    role: Literal["admin", "inspector"]
 
 
 def create_access_token(user: AuthUser) -> tuple[str, int]:
@@ -99,7 +99,9 @@ def get_current_user(
         )
 
     role = str(user.get("role") or "")
-    if role not in {"admin", "hr"}:
+    if role == "hr":
+        role = "inspector"
+    if role not in {"admin", "inspector"}:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid user role",
@@ -122,10 +124,15 @@ def require_admin(user: AuthUser = Depends(get_current_user)) -> AuthUser:
     return user
 
 
-def require_hr_or_admin(user: AuthUser = Depends(get_current_user)) -> AuthUser:
-    if user["role"] not in {"hr", "admin"}:
+def require_inspector_or_admin(user: AuthUser = Depends(get_current_user)) -> AuthUser:
+    if user["role"] not in {"inspector", "admin"}:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="HR/Admin access required",
+            detail="Inspector/Admin access required",
         )
     return user
+
+
+def require_hr_or_admin(user: AuthUser = Depends(get_current_user)) -> AuthUser:
+    # Backward-compatible alias for legacy imports.
+    return require_inspector_or_admin(user)

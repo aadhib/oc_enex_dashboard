@@ -2,8 +2,10 @@
 
 type EmployeeItem = {
   emp_id: number | string;
+  employee_id?: number | string;
   card_no: string;
   employee_name: string;
+  department?: string | null;
 };
 
 type EmployeesPanelProps = {
@@ -34,7 +36,7 @@ export default function EmployeesPanel({
         <input
           value={search}
           onChange={(event) => onSearchChange(event.target.value)}
-          placeholder="Search by name or CardNo"
+          placeholder="Search by Name, Card No or EmpID"
           className="mb-3 w-full rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none transition focus:border-cyan-400"
         />
       </div>
@@ -42,6 +44,15 @@ export default function EmployeesPanel({
       <div className="flex-1 min-h-0 overflow-y-auto pr-1 space-y-2 table-scroll">
         {employees.map((employee) => {
           const active = employee.card_no === selectedCardNo;
+          const employeeId = String(employee.employee_id ?? employee.emp_id ?? "").trim();
+          const department = String(employee.department ?? "").trim();
+          const detailParts = [employee.card_no];
+          if (employeeId) {
+            detailParts.push(`EmpID: ${employeeId}`);
+          }
+          if (department) {
+            detailParts.push(department);
+          }
           return (
             <button
               key={`${employee.emp_id}-${employee.card_no}`}
@@ -54,7 +65,7 @@ export default function EmployeesPanel({
               }`}
             >
               <p className="font-medium leading-tight">{employee.employee_name}</p>
-              <p className={`mt-1 text-xs ${active ? "text-cyan-200/80" : "text-zinc-500"}`}>{employee.card_no}</p>
+              <p className={`mt-1 text-xs ${active ? "text-cyan-200/80" : "text-zinc-500"}`}>{detailParts.join(" • ")}</p>
             </button>
           );
         })}

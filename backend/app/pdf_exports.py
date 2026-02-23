@@ -300,7 +300,7 @@ def draw_header(
 
     title_font = "Helvetica-Bold"
     title_size = HEADER_TITLE_FONT_SIZE
-    title_text = _safe_text(title, fallback="Oilchem Attendance Report")
+    title_text = _safe_text(title, fallback="Oilchem Entry/Exit Report")
 
     title_width = canv.stringWidth(title_text, title_font, title_size)
     title_x = (page_width - title_width) / 2.0
@@ -803,7 +803,7 @@ def generate_daily_pdf(report: dict[str, Any]) -> bytes:
             story.append(Paragraph(f"- {_safe_text(note)}", _STYLES["BodyText"]))
 
     return _build_document(
-        title="Oilchem Daily Attendance Report",
+        title="Oilchem Daily Entry/Exit Report",
         subtitle_lines=[
             f"Employee: {employee_name} | Card Number: {card_no}",
             f"Report Date: {report_date} | Generated: {generated_at}",
@@ -901,7 +901,7 @@ def generate_monthly_pdf(report: dict[str, Any]) -> bytes:
     _append_kpi_grid(story, cards=info_cards, max_cols=2, gap=KPI_GAP_X, card_h=KPI_CARD_HEIGHT - 6, row_gap=KPI_GAP_Y)
     story.append(Spacer(1, KPI_GAP_AFTER))
 
-    story.append(_build_section_heading("Monthly Attendance Summary"))
+    story.append(_build_section_heading("Monthly Entry/Exit Summary"))
     story.append(Spacer(1, 2))
     story.append(
         _build_table(
@@ -924,7 +924,7 @@ def generate_monthly_pdf(report: dict[str, Any]) -> bytes:
     )
 
     return _build_document(
-        title="Oilchem Monthly Attendance Report",
+        title="Oilchem Monthly Entry/Exit Report",
         subtitle_lines=[
             f"Employee: {employee_name} | Card Number: {card_no}",
             f"Period: {period} | Generated: {generated_at}",
@@ -1064,10 +1064,246 @@ def generate_yearly_pdf(report: dict[str, Any]) -> bytes:
     )
 
     return _build_document(
-        title="Oilchem Yearly Attendance Report",
+        title="Oilchem Yearly Entry/Exit Report",
         subtitle_lines=[
             f"Employee: {employee_name} | Card Number: {card_no}",
             f"Year: {year_label} | Generated: {generated_at}",
+        ],
+        story=story,
+    )
+
+
+def _summary_cards_for_all_report(
+    *,
+    summary: dict[str, Any],
+    include_working_days: bool,
+) -> list[dict[str, str]]:
+    total_employees = _to_int(summary.get("total_employees")) or 0
+    total_in = _safe_text(summary.get("total_in_hhmm"), fallback=_safe_text(_minutes_to_hhmm(_to_int(summary.get("total_in_minutes"))), fallback="N/A"))
+    total_out = _safe_text(summary.get("total_out_hhmm"), fallback=_safe_text(_minutes_to_hhmm(_to_int(summary.get("total_out_minutes"))), fallback="N/A"))
+    missing = _to_int(summary.get("missing_punch_count")) or 0
+
+    cards: list[dict[str, str]] = [
+        {"label": "Total Employees", "value": str(total_employees)},
+        {"label": "Total IN Time", "value": total_in},
+        {"label": "Total OUT Time", "value": total_out},
+    ]
+
+    if include_working_days:
+        cards.append({"label": "Total Working Days", "value": str(_to_int(summary.get("total_working_days")) or 0)})
+        cards.append({"label": "Missing Punch Count", "value": str(missing)})
+    else:
+        cards.append({"label": "Employees Present", "value": str(_to_int(summary.get("total_working_days")) or 0)})
+        cards.append({"label": "Missing Punch Count", "value": str(missing)})
+
+    return cards
+
+
+def generate_daily_all_pdf(report: dict[str, Any]) -> bytes:
+    generated_at = datetime.now().strftime("%Y-%m-%d %I:%M %p")
+    report_date = _safe_text(report.get("date"), fallback="N/A")
+    summary = dict(report.get("summary") or {})
+    rows_payload = list(report.get("rows") or [])
+
+    cards = _summary_cards_for_all_report(summary=summary, include_working_days=False)
+    row_data: list[list[str]] = []
+    for row in rows_payload:
+        first_in = _format_time_12h(row.get("first_in")) if _has_value(row.get("first_in")) else "-"
+        last_out = _format_time_12h(row.get("last_out")) if _has_value(row.get("last_out")) else "-"
+        duration_text = _safe_text(
+            row.get("duration_hhmm"),
+            fallback=_safe_text(_minutes_to_hhmm(_to_int(row.get("duration_minutes"))), fallback="N/A"),
+        )
+        total_in = _safe_text(
+            row.get("total_in_hhmm"),
+            fallback=_safe_text(_minutes_to_hhmm(_to_int(row.get("total_in_minutes"))), fallback="N/A"),
+        )
+        total_out = _safe_text(
+            row.get("total_out_hhmm"),
+            fallback=_safe_text(_minutes_to_hhmm(_to_int(row.get("total_out_minutes"))), fallback="N/A"),
+        )
+        row_data.append(
+            [
+                _safe_text(row.get("employee_name"), fallback="-"),
+                _safe_text(row.get("card_no"), fallback="-"),
+                first_in,
+                last_out,
+                duration_text,
+                total_in,
+                total_out,
+                str(_to_int(row.get("sessions_count")) or 0),
+            ]
+        )
+
+    total_duration_text = _safe_text(
+        summary.get("total_duration_readable"),
+        fallback=_safe_text(_minutes_to_readable(_to_int(summary.get("total_duration_minutes"))), fallback="N/A"),
+    )
+    story: list[Any] = []
+    _append_kpi_grid(story, cards=cards, max_cols=4, gap=KPI_GAP_X, card_h=KPI_CARD_HEIGHT, row_gap=KPI_GAP_Y)
+    story.append(Spacer(1, KPI_GAP_AFTER))
+    story.append(_build_section_heading("Daily Entry/Exit Summary (All Employees)"))
+    story.append(Spacer(1, 2))
+    story.append(
+        _build_table(
+            headers=["Employee", "CardNo", "First IN", "Last OUT", "Total Duration", "Total In Hours", "Total Out Hours", "Sessions"],
+            body_rows=row_data,
+            col_widths=[
+                CONTENT_WIDTH * 0.19,
+                CONTENT_WIDTH * 0.11,
+                CONTENT_WIDTH * 0.14,
+                CONTENT_WIDTH * 0.14,
+                CONTENT_WIDTH * 0.12,
+                CONTENT_WIDTH * 0.11,
+                CONTENT_WIDTH * 0.11,
+                CONTENT_WIDTH * 0.08,
+            ],
+            total_rows=[
+                ("Grand Total Duration", total_duration_text),
+                ("Total In Hour", _safe_text(summary.get("total_in_hhmm"), fallback="N/A")),
+                ("Total Out Hour", _safe_text(summary.get("total_out_hhmm"), fallback="N/A")),
+            ],
+            total_span_end=6,
+        )
+    )
+
+    return _build_document(
+        title="Oilchem Daily Entry/Exit Report (All Employees)",
+        subtitle_lines=[
+            f"Period: {report_date}",
+            f"Generated: {generated_at}",
+        ],
+        story=story,
+    )
+
+
+def generate_monthly_all_pdf(report: dict[str, Any]) -> bytes:
+    generated_at = datetime.now().strftime("%Y-%m-%d %I:%M %p")
+    month_value = _safe_text(report.get("month"), fallback="N/A")
+    summary = dict(report.get("summary") or {})
+    rows_payload = list(report.get("rows") or [])
+
+    cards = _summary_cards_for_all_report(summary=summary, include_working_days=True)
+    row_data: list[list[str]] = []
+    for row in rows_payload:
+        total_hours = _safe_text(
+            row.get("total_duration_readable"),
+            fallback=_safe_text(_minutes_to_readable(_to_int(row.get("total_minutes"))), fallback="N/A"),
+        )
+        avg_hours = _safe_text(
+            row.get("avg_duration_hhmm"),
+            fallback=_safe_text(_minutes_to_hhmm(_to_int(row.get("avg_minutes_per_day"))), fallback="N/A"),
+        )
+        row_data.append(
+            [
+                _safe_text(row.get("employee_name"), fallback="-"),
+                _safe_text(row.get("card_no"), fallback="-"),
+                str(_to_int(row.get("working_days")) or 0),
+                total_hours,
+                avg_hours,
+                str(_to_int(row.get("missing_punch_days")) or 0),
+                str(_to_int(row.get("sessions_count")) or 0),
+            ]
+        )
+
+    story: list[Any] = []
+    _append_kpi_grid(story, cards=cards, max_cols=4, gap=KPI_GAP_X, card_h=KPI_CARD_HEIGHT, row_gap=KPI_GAP_Y)
+    story.append(Spacer(1, KPI_GAP_AFTER))
+    story.append(_build_section_heading("Monthly Entry/Exit Summary (All Employees)"))
+    story.append(Spacer(1, 2))
+    story.append(
+        _build_table(
+            headers=["Employee", "CardNo", "Working Days", "Total Hours", "Avg Hours/Day", "Missing Punch Days", "Total Sessions"],
+            body_rows=row_data,
+            col_widths=[
+                CONTENT_WIDTH * 0.22,
+                CONTENT_WIDTH * 0.12,
+                CONTENT_WIDTH * 0.11,
+                CONTENT_WIDTH * 0.20,
+                CONTENT_WIDTH * 0.13,
+                CONTENT_WIDTH * 0.12,
+                CONTENT_WIDTH * 0.10,
+            ],
+            total_rows=[
+                ("Grand Total Hours (Month)", _safe_text(summary.get("total_work_readable"), fallback="N/A")),
+                ("Total In Hour", _safe_text(summary.get("total_in_hhmm"), fallback="N/A")),
+                ("Total Out Hour", _safe_text(summary.get("total_out_hhmm"), fallback="N/A")),
+            ],
+            total_span_end=5,
+        )
+    )
+
+    return _build_document(
+        title="Oilchem Monthly Entry/Exit Report (All Employees)",
+        subtitle_lines=[
+            f"Period: {month_value}",
+            f"Generated: {generated_at}",
+        ],
+        story=story,
+    )
+
+
+def generate_yearly_all_pdf(report: dict[str, Any]) -> bytes:
+    generated_at = datetime.now().strftime("%Y-%m-%d %I:%M %p")
+    year_value = _safe_text(report.get("year"), fallback="N/A")
+    summary = dict(report.get("summary") or {})
+    rows_payload = list(report.get("rows") or [])
+
+    cards = _summary_cards_for_all_report(summary=summary, include_working_days=True)
+    row_data: list[list[str]] = []
+    for row in rows_payload:
+        total_hours = _safe_text(
+            row.get("total_duration_readable"),
+            fallback=_safe_text(_minutes_to_readable(_to_int(row.get("total_minutes"))), fallback="N/A"),
+        )
+        avg_hours = _safe_text(
+            row.get("avg_duration_hhmm"),
+            fallback=_safe_text(_minutes_to_hhmm(_to_int(row.get("avg_minutes_per_day"))), fallback="N/A"),
+        )
+        row_data.append(
+            [
+                _safe_text(row.get("employee_name"), fallback="-"),
+                _safe_text(row.get("card_no"), fallback="-"),
+                str(_to_int(row.get("working_days")) or 0),
+                total_hours,
+                avg_hours,
+                str(_to_int(row.get("missing_punch_days")) or 0),
+                str(_to_int(row.get("sessions_count")) or 0),
+            ]
+        )
+
+    story: list[Any] = []
+    _append_kpi_grid(story, cards=cards, max_cols=4, gap=KPI_GAP_X, card_h=KPI_CARD_HEIGHT, row_gap=KPI_GAP_Y)
+    story.append(Spacer(1, KPI_GAP_AFTER))
+    story.append(_build_section_heading("Yearly Entry/Exit Summary (All Employees)"))
+    story.append(Spacer(1, 2))
+    story.append(
+        _build_table(
+            headers=["Employee", "CardNo", "Working Days", "Total Hours", "Avg Hours/Day", "Missing Punch Days", "Total Sessions"],
+            body_rows=row_data,
+            col_widths=[
+                CONTENT_WIDTH * 0.22,
+                CONTENT_WIDTH * 0.12,
+                CONTENT_WIDTH * 0.11,
+                CONTENT_WIDTH * 0.20,
+                CONTENT_WIDTH * 0.13,
+                CONTENT_WIDTH * 0.12,
+                CONTENT_WIDTH * 0.10,
+            ],
+            total_rows=[
+                ("Grand Total Hours (Year)", _safe_text(summary.get("total_work_readable"), fallback="N/A")),
+                ("Total In Hour", _safe_text(summary.get("total_in_hhmm"), fallback="N/A")),
+                ("Total Out Hour", _safe_text(summary.get("total_out_hhmm"), fallback="N/A")),
+            ],
+            total_span_end=5,
+        )
+    )
+
+    return _build_document(
+        title="Oilchem Yearly Entry/Exit Report (All Employees)",
+        subtitle_lines=[
+            f"Year: {year_value}",
+            f"Generated: {generated_at}",
         ],
         story=story,
     )
@@ -1083,3 +1319,15 @@ def build_monthly_pdf(report: dict[str, Any]) -> bytes:
 
 def build_yearly_pdf(report: dict[str, Any]) -> bytes:
     return generate_yearly_pdf(report)
+
+
+def build_daily_all_pdf(report: dict[str, Any]) -> bytes:
+    return generate_daily_all_pdf(report)
+
+
+def build_monthly_all_pdf(report: dict[str, Any]) -> bytes:
+    return generate_monthly_all_pdf(report)
+
+
+def build_yearly_all_pdf(report: dict[str, Any]) -> bytes:
+    return generate_yearly_all_pdf(report)

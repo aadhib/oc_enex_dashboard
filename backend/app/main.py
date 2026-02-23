@@ -12,18 +12,23 @@ from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
 from .app_db import (
+    count_active_admin_users,
+    create_user,
     create_hr_user,
     create_password_reset,
+    delete_user,
     get_employee_settings_map,
     get_smtp_settings,
     get_user_by_id,
     get_user_by_login,
     init_app_db,
+    list_users,
     list_hr_users,
     list_notification_logs,
     set_user_active,
     set_user_password,
     touch_user_login,
+    update_user,
     upsert_employee_setting,
     upsert_smtp_settings,
     redeem_password_reset,
@@ -34,7 +39,7 @@ from .auth import (
     create_access_token,
     get_current_user,
     require_admin,
-    require_hr_or_admin,
+    require_inspector_or_admin,
 )
 from .config import settings
 from .db import (
@@ -45,14 +50,24 @@ from .db import (
     validate_db_server_for_startup,
 )
 from .notifications import run_notifications
-from .pdf_exports import build_daily_pdf, build_monthly_pdf, build_yearly_pdf
+from .pdf_exports import (
+    build_daily_all_pdf,
+    build_daily_pdf,
+    build_monthly_all_pdf,
+    build_monthly_pdf,
+    build_yearly_all_pdf,
+    build_yearly_pdf,
+)
 from .rate_limit import build_rate_limit_middleware
 from .reports import (
     fetch_dashboard_summary,
     fetch_daily_report,
+    fetch_daily_report_all_employees,
     fetch_employees,
     fetch_monthly_report,
+    fetch_monthly_report_all_employees,
     fetch_yearly_report,
+    fetch_yearly_report_all_employees,
 )
 from .schemas import (
     AuthMeResponse,
@@ -60,6 +75,7 @@ from .schemas import (
     CreateHRUserRequest,
     DashboardSummaryResponse,
     DailyReport,
+    CreateUserRequest,
     EmployeeSettingItem,
     EmployeeSettingsResponse,
     EmployeeSettingUpsertRequest,
@@ -76,19 +92,22 @@ from .schemas import (
     SMTPSettingsResponse,
     SetTempPasswordRequest,
     UpdateUserActiveRequest,
+    UpdateUserRequest,
+    UserItem,
+    UsersResponse,
     YearlyReport,
 )
 from .security import verify_password
 
 _BACKEND_ENV_PATH = Path(__file__).resolve().parents[1] / ".env"
 
-app = FastAPI(title="Oilchem HR Admin API", version="2.0.0")
+app = FastAPI(title="Oilchem Entry/Exit Admin API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allow_origins,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -141,17 +160,28 @@ def _build_pdf_filename(prefix: str, employee_name: str, card_no: str, period: s
     return f"{prefix}_{safe_name}_{safe_card}_{safe_period}.pdf"
 
 
-def _serialize_hr_user(row: dict[str, Any]) -> HRUserItem:
-    return HRUserItem(
+def _serialize_user(row: dict[str, Any]) -> UserItem:
+    role = str(row.get("role") or "inspector").strip().lower()
+    if role == "hr":
+        role = "inspector"
+    if role not in {"admin", "inspector"}:
+        role = "inspector"
+
+    return UserItem(
         id=int(row["id"]),
         email=str(row.get("email") or ""),
         username=str(row.get("username") or ""),
-        role=str(row.get("role") or "hr"),
+        role=role,  # type: ignore[arg-type]
         is_active=bool(row.get("is_active")),
         created_at=str(row.get("created_at") or ""),
         updated_at=str(row.get("updated_at") or ""),
         last_login_at=(str(row.get("last_login_at")) if row.get("last_login_at") else None),
     )
+
+
+def _serialize_hr_user(row: dict[str, Any]) -> HRUserItem:
+    normalized = _serialize_user(row)
+    return HRUserItem(**normalized.model_dump())
 
 
 def _smtp_is_ready(config: dict[str, Any]) -> bool:
@@ -166,14 +196,14 @@ def _send_reset_email(to_email: str, username: str, reset_url: str) -> None:
     host = str(smtp_config.get("host") or "").strip()
     port = int(smtp_config.get("port") or 0)
     from_email = str(smtp_config.get("from_email") or "").strip()
-    from_name = str(smtp_config.get("from_name") or "Oilchem HR Admin").strip() or "Oilchem HR Admin"
+    from_name = str(smtp_config.get("from_name") or "Oilchem Entry/Exit Admin").strip() or "Oilchem Entry/Exit Admin"
     smtp_username = str(smtp_config.get("username") or "").strip()
     smtp_password = str(smtp_config.get("password") or "")
     use_tls = bool(smtp_config.get("use_tls"))
     use_ssl = bool(smtp_config.get("use_ssl"))
 
     message = EmailMessage()
-    message["Subject"] = "Oilchem HR Admin: Password Reset Link"
+    message["Subject"] = "Oilchem Entry/Exit Admin: Password Reset Link"
     message["From"] = f"{from_name} <{from_email}>"
     message["To"] = to_email
     message.set_content(
@@ -181,7 +211,7 @@ def _send_reset_email(to_email: str, username: str, reset_url: str) -> None:
             [
                 "Hello,",
                 "",
-                f"A password reset was requested for your HR user ({username}).",
+                f"A password reset was requested for your user account ({username}).",
                 f"Reset link: {reset_url}",
                 f"This link expires in {settings.password_reset_expiry_minutes} minutes.",
             ]
@@ -258,8 +288,10 @@ def login(request: LoginRequest, response: Response) -> AuthResponse:
             detail="Invalid username/email or password",
         )
 
-    role = str(user.get("role") or "")
-    if role not in {"admin", "hr"}:
+    role = str(user.get("role") or "").strip().lower()
+    if role == "hr":
+        role = "inspector"
+    if role not in {"admin", "inspector"}:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Role is not allowed",
@@ -343,17 +375,17 @@ def save_admin_smtp_settings(
     return SMTPSettingsResponse(**data)
 
 
-@app.get("/api/admin/hr-users", response_model=HRUsersResponse)
-def get_hr_users(_user: AuthUser = Depends(require_admin)) -> HRUsersResponse:
-    users = [_serialize_hr_user(row) for row in list_hr_users()]
-    return HRUsersResponse(users=users)
+@app.get("/api/users", response_model=UsersResponse)
+def get_users(_user: AuthUser = Depends(require_admin)) -> UsersResponse:
+    users = [_serialize_user(row) for row in list_users()]
+    return UsersResponse(users=users)
 
 
-@app.post("/api/admin/hr-users", response_model=HRUserItem)
-def add_hr_user(
-    payload: CreateHRUserRequest,
+@app.post("/api/users", response_model=UserItem)
+def add_user(
+    payload: CreateUserRequest,
     _user: AuthUser = Depends(require_admin),
-) -> HRUserItem:
+) -> UserItem:
     if "@" not in payload.email:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -361,63 +393,117 @@ def add_hr_user(
         )
 
     try:
-        user = create_hr_user(
+        user = create_user(
             email=payload.email,
             username=payload.username,
-            password=payload.temp_password,
+            password=payload.password,
+            role=payload.role,
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    return _serialize_hr_user(user)
+    return _serialize_user(user)
 
 
-@app.patch("/api/admin/hr-users/{user_id}/active", response_model=HRUserItem)
-def set_hr_user_active(
+@app.patch("/api/users/{user_id}", response_model=UserItem)
+def patch_user(
     user_id: int,
-    payload: UpdateUserActiveRequest,
-    _user: AuthUser = Depends(require_admin),
-) -> HRUserItem:
+    payload: UpdateUserRequest,
+    current_user: AuthUser = Depends(require_admin),
+) -> UserItem:
     target = get_user_by_id(user_id)
-    if not target or str(target.get("role")) != "hr":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="HR user not found")
+    if not target:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    set_user_active(user_id=user_id, is_active=payload.is_active)
-    updated = get_user_by_id(user_id)
-    if not updated:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="HR user not found")
+    if payload.is_active is False and target.get("role") == "admin" and count_active_admin_users() <= 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one active admin is required",
+        )
 
-    return _serialize_hr_user(updated)
+    if payload.is_active is False and int(target.get("id") or 0) == int(current_user["id"]):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot deactivate your own account",
+        )
+
+    if payload.role is not None and payload.role != "admin" and int(target.get("id") or 0) == int(current_user["id"]):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="You cannot remove your own admin role",
+        )
+
+    if payload.role is not None and payload.role != "admin" and str(target.get("role") or "") == "admin":
+        if count_active_admin_users() <= 1:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="At least one active admin is required",
+            )
+
+    try:
+        updated = update_user(
+            user_id=user_id,
+            email=payload.email,
+            password=payload.password,
+            role=payload.role,
+            is_active=payload.is_active,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    return _serialize_user(updated)
 
 
-@app.post("/api/admin/hr-users/{user_id}/set-password")
-def admin_set_hr_password(
+@app.delete("/api/users/{user_id}")
+def remove_user(
+    user_id: int,
+    current_user: AuthUser = Depends(require_admin),
+) -> dict[str, str]:
+    target = get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    if int(target.get("id") or 0) == int(current_user["id"]):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="You cannot delete your own account")
+
+    if str(target.get("role") or "") == "admin" and count_active_admin_users() <= 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one active admin is required",
+        )
+
+    delete_user(user_id)
+    return {"message": "User deleted"}
+
+
+@app.post("/api/users/{user_id}/set-password")
+def admin_set_user_password(
     user_id: int,
     payload: SetTempPasswordRequest,
     _user: AuthUser = Depends(require_admin),
 ) -> dict[str, str]:
     target = get_user_by_id(user_id)
-    if not target or str(target.get("role")) != "hr":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="HR user not found")
+    if not target:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
     set_user_password(user_id, payload.temp_password)
     return {"message": "Password updated"}
 
 
-@app.post("/api/admin/hr-users/{user_id}/reset-link", response_model=ResetLinkResponse)
-def generate_hr_reset_link(
+@app.post("/api/users/{user_id}/reset-link", response_model=ResetLinkResponse)
+def generate_user_reset_link(
     user_id: int,
     _user: AuthUser = Depends(require_admin),
 ) -> ResetLinkResponse:
     target = get_user_by_id(user_id)
-    if not target or str(target.get("role")) != "hr":
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="HR user not found")
+    if not target:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
     token = create_password_reset(user_id)
     reset_url = f"{settings.frontend_base_url}/reset-password?token={token}"
 
     email = str(target.get("email") or "").strip()
-    username = str(target.get("username") or "hr")
+    username = str(target.get("username") or "user")
     if email:
         try:
             _send_reset_email(email, username, reset_url)
@@ -432,10 +518,66 @@ def generate_hr_reset_link(
     )
 
 
+@app.get("/api/admin/hr-users", response_model=HRUsersResponse)
+def get_hr_users_legacy(_user: AuthUser = Depends(require_admin)) -> HRUsersResponse:
+    users = [_serialize_hr_user(row) for row in list_hr_users()]
+    return HRUsersResponse(users=users)
+
+
+@app.post("/api/admin/hr-users", response_model=HRUserItem)
+def add_hr_user_legacy(
+    payload: CreateHRUserRequest,
+    _user: AuthUser = Depends(require_admin),
+) -> HRUserItem:
+    if "@" not in payload.email:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="email is invalid",
+        )
+    try:
+        user = create_hr_user(email=payload.email, username=payload.username, password=payload.temp_password)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    return _serialize_hr_user(user)
+
+
+@app.patch("/api/admin/hr-users/{user_id}/active", response_model=HRUserItem)
+def set_hr_user_active_legacy(
+    user_id: int,
+    payload: UpdateUserActiveRequest,
+    _user: AuthUser = Depends(require_admin),
+) -> HRUserItem:
+    target = get_user_by_id(user_id)
+    if not target:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    set_user_active(user_id=user_id, is_active=payload.is_active)
+    updated = get_user_by_id(user_id)
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    return _serialize_hr_user(updated)
+
+
+@app.post("/api/admin/hr-users/{user_id}/set-password")
+def admin_set_hr_password_legacy(
+    user_id: int,
+    payload: SetTempPasswordRequest,
+    _user: AuthUser = Depends(require_admin),
+) -> dict[str, str]:
+    return admin_set_user_password(user_id=user_id, payload=payload, _user=_user)
+
+
+@app.post("/api/admin/hr-users/{user_id}/reset-link", response_model=ResetLinkResponse)
+def generate_hr_reset_link_legacy(
+    user_id: int,
+    _user: AuthUser = Depends(require_admin),
+) -> ResetLinkResponse:
+    return generate_user_reset_link(user_id=user_id, _user=_user)
+
+
 @app.get("/api/employees", response_model=EmployeesResponse)
 def list_employees(
     search: str = Query(default="", max_length=64),
-    _user: AuthUser = Depends(require_hr_or_admin),
+    _user: AuthUser = Depends(require_inspector_or_admin),
 ) -> EmployeesResponse:
     try:
         employees = fetch_employees(search.strip())
@@ -445,7 +587,7 @@ def list_employees(
 
 
 @app.get("/api/dashboard/summary", response_model=DashboardSummaryResponse)
-def dashboard_summary(_user: AuthUser = Depends(require_hr_or_admin)) -> DashboardSummaryResponse:
+def dashboard_summary(_user: AuthUser = Depends(require_inspector_or_admin)) -> DashboardSummaryResponse:
     try:
         payload = fetch_dashboard_summary()
     except DBOperationalError:
@@ -456,7 +598,7 @@ def dashboard_summary(_user: AuthUser = Depends(require_hr_or_admin)) -> Dashboa
 @app.get("/api/employee-settings", response_model=EmployeeSettingsResponse)
 def list_employee_settings(
     search: str = Query(default="", max_length=64),
-    _user: AuthUser = Depends(require_hr_or_admin),
+    _user: AuthUser = Depends(require_inspector_or_admin),
 ) -> EmployeeSettingsResponse:
     try:
         employees = fetch_employees(search.strip())
@@ -472,7 +614,7 @@ def list_employee_settings(
 
         payload.append(
             EmployeeSettingItem(
-                emp_id=employee.get("emp_id") or card_no,
+                emp_id=employee.get("emp_id") if employee.get("emp_id") is not None else "",
                 card_no=card_no,
                 employee_name=str(employee.get("employee_name") or card_no),
                 employee_email=str(db_setting.get("employee_email") or ""),
@@ -493,7 +635,7 @@ def list_employee_settings(
 def save_employee_setting(
     card_no: str,
     payload: EmployeeSettingUpsertRequest,
-    _user: AuthUser = Depends(require_hr_or_admin),
+    _user: AuthUser = Depends(require_inspector_or_admin),
 ) -> EmployeeSettingItem:
     card = card_no.strip()
     if not card:
@@ -509,7 +651,7 @@ def save_employee_setting(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
     return EmployeeSettingItem(
-        emp_id=saved.get("emp_id") or card,
+        emp_id=saved.get("emp_id") if saved.get("emp_id") is not None else "",
         card_no=card,
         employee_name=str(payload.employee_name or saved.get("employee_name_cache") or card),
         employee_email=str(saved.get("employee_email") or ""),
@@ -527,7 +669,7 @@ def save_employee_setting(
 def trigger_notifications(
     date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
     card_no: str | None = Query(default=None, max_length=64),
-    _user: AuthUser = Depends(require_hr_or_admin),
+    _user: AuthUser = Depends(require_admin),
 ) -> NotificationRunResponse:
     payload = run_notifications(date_value=date, card_no=(card_no.strip() if card_no else None))
     return NotificationRunResponse(**payload)
@@ -536,7 +678,7 @@ def trigger_notifications(
 @app.get("/api/notifications/logs", response_model=NotificationLogsResponse)
 def get_notification_logs(
     limit: int = Query(default=100, ge=1, le=500),
-    _user: AuthUser = Depends(require_hr_or_admin),
+    _user: AuthUser = Depends(require_admin),
 ) -> NotificationLogsResponse:
     logs = list_notification_logs(limit=limit)
     return NotificationLogsResponse(logs=logs)
@@ -546,7 +688,7 @@ def get_notification_logs(
 def get_daily_report(
     card_no: str = Query(..., min_length=1, max_length=64),
     date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    _user: AuthUser = Depends(require_hr_or_admin),
+    _user: AuthUser = Depends(require_inspector_or_admin),
 ) -> DailyReport:
     try:
         payload = fetch_daily_report(card_no=card_no.strip(), date_value=date)
@@ -559,7 +701,7 @@ def get_daily_report(
 def get_monthly_report(
     card_no: str = Query(..., min_length=1, max_length=64),
     month: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
-    _user: AuthUser = Depends(require_hr_or_admin),
+    _user: AuthUser = Depends(require_inspector_or_admin),
 ) -> MonthlyReport:
     try:
         payload = fetch_monthly_report(card_no=card_no.strip(), month_value=month)
@@ -572,7 +714,7 @@ def get_monthly_report(
 def get_yearly_report(
     card_no: str = Query(..., min_length=1, max_length=64),
     year: str = Query(..., pattern=r"^\d{4}$"),
-    _user: AuthUser = Depends(require_hr_or_admin),
+    _user: AuthUser = Depends(require_inspector_or_admin),
 ) -> YearlyReport:
     try:
         payload = fetch_yearly_report(card_no=card_no.strip(), year_value=year)
@@ -581,11 +723,53 @@ def get_yearly_report(
     return YearlyReport(**payload)
 
 
+@app.get("/api/reports/daily/all")
+def export_daily_all_employees_pdf(
+    date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
+    _user: AuthUser = Depends(require_inspector_or_admin),
+) -> Response:
+    try:
+        report = fetch_daily_report_all_employees(date_value=date)
+    except DBOperationalError:
+        return _db_connection_failed_response()
+    payload = build_daily_all_pdf(report)
+    filename = f"OC_All_D_{_sanitize_filename_part(date)}.pdf"
+    return _build_inline_pdf_response(filename=filename, payload=payload)
+
+
+@app.get("/api/reports/monthly/all")
+def export_monthly_all_employees_pdf(
+    month: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
+    _user: AuthUser = Depends(require_inspector_or_admin),
+) -> Response:
+    try:
+        report = fetch_monthly_report_all_employees(month_value=month)
+    except DBOperationalError:
+        return _db_connection_failed_response()
+    payload = build_monthly_all_pdf(report)
+    filename = f"OC_All_M_{_sanitize_filename_part(month)}.pdf"
+    return _build_inline_pdf_response(filename=filename, payload=payload)
+
+
+@app.get("/api/reports/yearly/all")
+def export_yearly_all_employees_pdf(
+    year: str = Query(..., pattern=r"^\d{4}$"),
+    _user: AuthUser = Depends(require_inspector_or_admin),
+) -> Response:
+    try:
+        report = fetch_yearly_report_all_employees(year_value=year)
+    except DBOperationalError:
+        return _db_connection_failed_response()
+    payload = build_yearly_all_pdf(report)
+    filename = f"OC_All_Y_{_sanitize_filename_part(year)}.pdf"
+    return _build_inline_pdf_response(filename=filename, payload=payload)
+
+
 @app.get("/api/export/daily.pdf")
 def export_daily_pdf(
     card_no: str = Query(..., min_length=1, max_length=64),
     date: str = Query(..., pattern=r"^\d{4}-\d{2}-\d{2}$"),
-    _user: AuthUser = Depends(require_hr_or_admin),
+    _user: AuthUser = Depends(require_inspector_or_admin),
 ) -> Response:
     try:
         report = fetch_daily_report(card_no=card_no.strip(), date_value=date)
@@ -605,7 +789,7 @@ def export_daily_pdf(
 def export_monthly_pdf(
     card_no: str = Query(..., min_length=1, max_length=64),
     month: str = Query(..., pattern=r"^\d{4}-\d{2}$"),
-    _user: AuthUser = Depends(require_hr_or_admin),
+    _user: AuthUser = Depends(require_inspector_or_admin),
 ) -> Response:
     try:
         report = fetch_monthly_report(card_no=card_no.strip(), month_value=month)
@@ -625,7 +809,7 @@ def export_monthly_pdf(
 def export_yearly_pdf(
     card_no: str = Query(..., min_length=1, max_length=64),
     year: str = Query(..., pattern=r"^\d{4}$"),
-    _user: AuthUser = Depends(require_hr_or_admin),
+    _user: AuthUser = Depends(require_inspector_or_admin),
 ) -> Response:
     try:
         report = fetch_yearly_report(card_no=card_no.strip(), year_value=year)

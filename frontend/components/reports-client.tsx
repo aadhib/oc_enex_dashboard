@@ -12,8 +12,10 @@ type SectionKey = "reports" | "employee-settings";
 
 type Employee = {
   emp_id: number | string;
+  employee_id?: number | string;
   card_no: string;
   employee_name: string;
+  department?: string | null;
 };
 
 type DailyReport = {
@@ -413,6 +415,20 @@ export default function ReportsClient() {
     return `/api/proxy/export/${tab}.pdf?${params.toString()}`;
   }, [dailyDate, monthValue, selectedCardNo, tab, yearValue]);
 
+  const allEmployeesExportUrl = useMemo(() => {
+    const params = new URLSearchParams();
+    if (tab === "daily") {
+      params.set("date", dailyDate);
+    }
+    if (tab === "monthly") {
+      params.set("month", monthValue);
+    }
+    if (tab === "yearly") {
+      params.set("year", yearValue);
+    }
+    return `/api/proxy/reports/${tab}/all?${params.toString()}`;
+  }, [dailyDate, monthValue, tab, yearValue]);
+
   async function saveEmployeeSetting() {
     const selectedEmployee = employees.find((item) => item.card_no === selectedCardNo);
     if (!selectedCardNo || !selectedEmployee) {
@@ -470,7 +486,14 @@ export default function ReportsClient() {
 
   const selectedEmployee = employees.find((employee) => employee.card_no === selectedCardNo);
   const selectedDepartment =
-    tab === "daily" ? dailyReport?.department : tab === "monthly" ? monthlyReport?.department : yearlyReport?.department;
+    String(selectedEmployee?.department ?? "").trim() ||
+    (tab === "daily" ? dailyReport?.department : tab === "monthly" ? monthlyReport?.department : yearlyReport?.department);
+  const selectedEmployeeId = String(selectedEmployee?.employee_id ?? selectedEmployee?.emp_id ?? "").trim();
+  const selectedEmployeeMeta = [
+    selectedEmployeeId ? `EmpID: ${selectedEmployeeId}` : "",
+    selectedDepartment ? selectedDepartment : "",
+    selectedEmployee?.card_no ? selectedEmployee.card_no : ""
+  ].filter(Boolean);
   const dailyRows = dailyReport?.rows ?? [];
 
   return (
@@ -503,18 +526,32 @@ export default function ReportsClient() {
               <h2 className="mt-1 text-xl font-medium text-zinc-100">
                 {selectedEmployee?.employee_name ?? dailyReport?.employee_name ?? "None"}
               </h2>
-              {selectedEmployee?.card_no ? <p className="mt-1 text-sm text-zinc-400">{selectedEmployee.card_no}</p> : null}
-              {selectedDepartment && section === "reports" ? <p className="mt-1 text-sm text-zinc-500">{selectedDepartment}</p> : null}
+              {selectedEmployeeMeta.length ? (
+                <p className="mt-1 text-sm text-zinc-400">{selectedEmployeeMeta.join(" • ")}</p>
+              ) : null}
             </div>
             {section === "reports" ? (
-              <button
-                type="button"
-                disabled={!exportUrl || reportLoading}
-                onClick={() => window.open(exportUrl, "_blank", "noopener,noreferrer")}
-                className="rounded-lg border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm text-zinc-100 transition hover:border-cyan-400 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                Export {tab.toUpperCase()} PDF
-              </button>
+              <div className="rounded-xl border border-zinc-800 bg-zinc-950/50 p-3">
+                <p className="text-xs uppercase tracking-[0.18em] text-zinc-500">Exports</p>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    disabled={!exportUrl || reportLoading}
+                    onClick={() => window.open(exportUrl, "_blank", "noopener,noreferrer")}
+                    className="rounded-lg border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100 transition hover:border-cyan-400 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Export {tab.toUpperCase()} PDF
+                  </button>
+                  <button
+                    type="button"
+                    disabled={reportLoading}
+                    onClick={() => window.open(allEmployeesExportUrl, "_blank", "noopener,noreferrer")}
+                    className="rounded-lg border border-cyan-500/60 bg-cyan-500/10 px-3 py-2 text-sm text-cyan-100 transition hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    Export {tab.toUpperCase()} (All Employees)
+                  </button>
+                </div>
+              </div>
             ) : null}
           </div>
 

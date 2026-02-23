@@ -94,7 +94,7 @@ export default function HomeDashboardClient() {
       <AppHeader
         me={me}
         title="Home Dashboard"
-        subtitle="At-a-glance attendance state"
+        subtitle="At-a-glance entry/exit state"
         onLogout={logout}
       />
 

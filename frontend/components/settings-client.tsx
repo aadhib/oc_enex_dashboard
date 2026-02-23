@@ -6,8 +6,8 @@ import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react
 import AppHeader from "@/components/app-header";
 import { useAuthUser } from "@/components/use-auth-user";
 
-type SettingsSection = "smtp" | "hr-users" | "notifications";
-type SettingsHref = "/settings/smtp" | "/settings/hr-users" | "/settings/notifications";
+type SettingsSection = "smtp" | "users" | "notifications";
+type SettingsHref = "/settings/smtp" | "/settings/users" | "/settings/notifications";
 
 type Employee = {
   emp_id: number | string;
@@ -28,11 +28,13 @@ type SMTPSettings = {
   updated_at: string | null;
 };
 
-type HRUser = {
+type UserRole = "admin" | "inspector";
+
+type UserItem = {
   id: number;
   email: string;
   username: string;
-  role: string;
+  role: UserRole;
   is_active: boolean;
   created_at: string;
   updated_at: string;
@@ -71,7 +73,7 @@ function todayIsoDate(): string {
 
 const SETTINGS_TABS: Array<{ key: SettingsSection; href: SettingsHref; label: string }> = [
   { key: "smtp", href: "/settings/smtp", label: "SMTP Settings" },
-  { key: "hr-users", href: "/settings/hr-users", label: "HR Users" },
+  { key: "users", href: "/settings/users", label: "Users" },
   { key: "notifications", href: "/settings/notifications", label: "Notifications" }
 ];
 
@@ -84,7 +86,7 @@ export default function SettingsClient({ section }: SettingsClientProps) {
     username: "",
     password: "",
     from_email: "",
-    from_name: "Oilchem HR Admin",
+    from_name: "Oilchem Entry/Exit Admin",
     use_tls: true,
     use_ssl: false,
     cc_list: "",
@@ -94,10 +96,10 @@ export default function SettingsClient({ section }: SettingsClientProps) {
   const [smtpSaving, setSmtpSaving] = useState(false);
   const [smtpMessage, setSmtpMessage] = useState("");
 
-  const [hrUsers, setHrUsers] = useState<HRUser[]>([]);
-  const [hrLoading, setHrLoading] = useState(false);
-  const [hrMessage, setHrMessage] = useState("");
-  const [newHrUser, setNewHrUser] = useState({ email: "", username: "", temp_password: "" });
+  const [users, setUsers] = useState<UserItem[]>([]);
+  const [usersLoading, setUsersLoading] = useState(false);
+  const [usersMessage, setUsersMessage] = useState("");
+  const [newUser, setNewUser] = useState({ email: "", username: "", password: "", role: "inspector" as UserRole });
 
   const [notifyDate, setNotifyDate] = useState(todayIsoDate());
   const [notifyRunning, setNotifyRunning] = useState(false);
@@ -113,82 +115,72 @@ export default function SettingsClient({ section }: SettingsClientProps) {
     [employees, selectedCardNo]
   );
 
-  useEffect(() => {
-    if (section !== "smtp" || me?.role !== "admin") {
-      return;
-    }
-
-    let cancelled = false;
-
-    async function loadSmtp() {
-      setSmtpLoading(true);
-      setSmtpMessage("");
-      setError("");
-
-      try {
-        const response = await fetch("/api/proxy/admin/smtp-settings", { cache: "no-store" });
-        if (await handleUnauthorized(response.status)) {
-          return;
-        }
-        if (!response.ok) {
-          const payload = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
-          throw new Error(payload?.error ?? payload?.detail ?? "Failed to load SMTP settings");
-        }
-
-        const payload = (await response.json()) as Omit<SMTPSettings, "password">;
-        if (!cancelled) {
-          setSmtpForm((current) => ({ ...current, ...payload, password: "" }));
-        }
-      } catch (err) {
-        if (!cancelled) {
-          setError((err as Error).message || "Failed to load SMTP settings");
-        }
-      } finally {
-        if (!cancelled) {
-          setSmtpLoading(false);
-        }
-      }
-    }
-
-    loadSmtp();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [handleUnauthorized, me?.role, section, setError]);
-
-  const loadHrUsers = useCallback(async () => {
+  const loadSmtp = useCallback(async () => {
     if (me?.role !== "admin") {
       return;
     }
 
-    setHrLoading(true);
-    setHrMessage("");
+    setSmtpLoading(true);
+    setSmtpMessage("");
+    setError("");
 
     try {
-      const response = await fetch("/api/proxy/admin/hr-users", { cache: "no-store" });
+      const response = await fetch("/api/proxy/admin/smtp-settings", { cache: "no-store" });
       if (await handleUnauthorized(response.status)) {
         return;
       }
       if (!response.ok) {
         const payload = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
-        throw new Error(payload?.error ?? payload?.detail ?? "Failed to load HR users");
+        throw new Error(payload?.error ?? payload?.detail ?? "Failed to load SMTP settings");
       }
 
-      const payload = (await response.json()) as { users: HRUser[] };
-      setHrUsers(payload.users);
+      const payload = (await response.json()) as Omit<SMTPSettings, "password">;
+      setSmtpForm((current) => ({ ...current, ...payload, password: "" }));
     } catch (err) {
-      setError((err as Error).message || "Failed to load HR users");
+      setError((err as Error).message || "Failed to load SMTP settings");
     } finally {
-      setHrLoading(false);
+      setSmtpLoading(false);
+    }
+  }, [handleUnauthorized, me?.role, setError]);
+
+  const loadUsers = useCallback(async () => {
+    if (me?.role !== "admin") {
+      return;
+    }
+
+    setUsersLoading(true);
+    setUsersMessage("");
+
+    try {
+      const response = await fetch("/api/proxy/users", { cache: "no-store" });
+      if (await handleUnauthorized(response.status)) {
+        return;
+      }
+      if (!response.ok) {
+        const payload = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
+        throw new Error(payload?.error ?? payload?.detail ?? "Failed to load users");
+      }
+
+      const payload = (await response.json()) as { users: UserItem[] };
+      setUsers(payload.users);
+    } catch (err) {
+      setError((err as Error).message || "Failed to load users");
+    } finally {
+      setUsersLoading(false);
     }
   }, [handleUnauthorized, me?.role, setError]);
 
   useEffect(() => {
-    if (section === "hr-users" && me?.role === "admin") {
-      loadHrUsers();
+    if (section === "smtp" && me?.role === "admin") {
+      loadSmtp();
     }
-  }, [loadHrUsers, me?.role, section]);
+  }, [loadSmtp, me?.role, section]);
+
+  useEffect(() => {
+    if (section === "users" && me?.role === "admin") {
+      loadUsers();
+    }
+  }, [loadUsers, me?.role, section]);
 
   useEffect(() => {
     if (section !== "notifications" || me?.role !== "admin") {
@@ -198,6 +190,7 @@ export default function SettingsClient({ section }: SettingsClientProps) {
     const controller = new AbortController();
     const timer = setTimeout(async () => {
       setEmployeeLoading(true);
+      setNotifyMessage("");
 
       try {
         const response = await fetch(`/api/proxy/employees?search=${encodeURIComponent(employeeSearch)}`, {
@@ -216,7 +209,6 @@ export default function SettingsClient({ section }: SettingsClientProps) {
 
         const payload = (await response.json()) as { employees: Employee[] };
         setEmployees(payload.employees);
-
         setSelectedCardNo((current) => {
           if (!payload.employees.length) {
             return "";
@@ -271,15 +263,15 @@ export default function SettingsClient({ section }: SettingsClientProps) {
     }
   }
 
-  async function createHrUser(event: FormEvent<HTMLFormElement>) {
+  async function createUser(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    setHrMessage("");
+    setUsersMessage("");
 
     try {
-      const response = await fetch("/api/proxy/admin/hr-users", {
+      const response = await fetch("/api/proxy/users", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(newHrUser)
+        body: JSON.stringify(newUser)
       });
 
       if (await handleUnauthorized(response.status)) {
@@ -288,92 +280,115 @@ export default function SettingsClient({ section }: SettingsClientProps) {
 
       if (!response.ok) {
         const payload = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
-        throw new Error(payload?.error ?? payload?.detail ?? "Failed to create HR user");
+        throw new Error(payload?.error ?? payload?.detail ?? "Failed to create user");
       }
 
-      setNewHrUser({ email: "", username: "", temp_password: "" });
-      setHrMessage("HR user created.");
-      await loadHrUsers();
+      setNewUser({ email: "", username: "", password: "", role: "inspector" });
+      setUsersMessage("User created.");
+      await loadUsers();
     } catch (err) {
-      setHrMessage((err as Error).message || "Failed to create HR user");
+      setUsersMessage((err as Error).message || "Failed to create user");
     }
   }
 
-  async function toggleHrUser(user: HRUser) {
-    setHrMessage("");
+  async function patchUser(userId: number, payload: { role?: UserRole; is_active?: boolean; password?: string }) {
+    const response = await fetch(`/api/proxy/users/${userId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
 
+    if (await handleUnauthorized(response.status)) {
+      return false;
+    }
+
+    if (!response.ok) {
+      const body = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
+      throw new Error(body?.error ?? body?.detail ?? "Failed to update user");
+    }
+
+    return true;
+  }
+
+  async function changeUserRole(user: UserItem, role: UserRole) {
+    setUsersMessage("");
     try {
-      const response = await fetch(`/api/proxy/admin/hr-users/${user.id}/active`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ is_active: !user.is_active })
-      });
-
-      if (await handleUnauthorized(response.status)) {
-        return;
-      }
-
-      if (!response.ok) {
-        const payload = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
-        throw new Error(payload?.error ?? payload?.detail ?? "Failed to update HR user");
-      }
-
-      setHrMessage(`User ${user.username} ${user.is_active ? "disabled" : "enabled"}.`);
-      await loadHrUsers();
+      await patchUser(user.id, { role });
+      setUsersMessage(`Updated role for ${user.username}.`);
+      await loadUsers();
     } catch (err) {
-      setHrMessage((err as Error).message || "Failed to update HR user");
+      setUsersMessage((err as Error).message || "Failed to update role");
     }
   }
 
-  async function sendResetLink(user: HRUser) {
-    setHrMessage("");
+  async function toggleUser(user: UserItem) {
+    setUsersMessage("");
+    try {
+      await patchUser(user.id, { is_active: !user.is_active });
+      setUsersMessage(`User ${user.username} ${user.is_active ? "disabled" : "enabled"}.`);
+      await loadUsers();
+    } catch (err) {
+      setUsersMessage((err as Error).message || "Failed to update user status");
+    }
+  }
+
+  async function resetPassword(user: UserItem) {
+    const newPassword = window.prompt(`Set a temporary password for ${user.username}:`);
+    if (!newPassword) {
+      return;
+    }
+
+    setUsersMessage("");
+    try {
+      await patchUser(user.id, { password: newPassword });
+      setUsersMessage(`Password updated for ${user.username}.`);
+      await loadUsers();
+    } catch (err) {
+      setUsersMessage((err as Error).message || "Failed to update password");
+    }
+  }
+
+  async function createResetLink(user: UserItem) {
+    setUsersMessage("");
 
     try {
-      const response = await fetch(`/api/proxy/admin/hr-users/${user.id}/reset-link`, { method: "POST" });
-
+      const response = await fetch(`/api/proxy/users/${user.id}/reset-link`, { method: "POST" });
       if (await handleUnauthorized(response.status)) {
         return;
       }
-
       if (!response.ok) {
         const payload = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
         throw new Error(payload?.error ?? payload?.detail ?? "Failed to generate reset link");
       }
 
       const payload = (await response.json()) as { reset_url: string };
-      setHrMessage(`Reset link generated for ${user.username}: ${payload.reset_url}`);
+      setUsersMessage(`Reset link generated for ${user.username}: ${payload.reset_url}`);
     } catch (err) {
-      setHrMessage((err as Error).message || "Failed to generate reset link");
+      setUsersMessage((err as Error).message || "Failed to generate reset link");
     }
   }
 
-  async function setTempPassword(user: HRUser) {
-    const tempPassword = window.prompt(`Set a temporary password for ${user.username}:`);
-    if (!tempPassword) {
+  async function deleteUserRow(user: UserItem) {
+    const confirmed = window.confirm(`Delete user ${user.username}? This action cannot be undone.`);
+    if (!confirmed) {
       return;
     }
 
-    setHrMessage("");
-
+    setUsersMessage("");
     try {
-      const response = await fetch(`/api/proxy/admin/hr-users/${user.id}/set-password`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ temp_password: tempPassword })
-      });
-
+      const response = await fetch(`/api/proxy/users/${user.id}`, { method: "DELETE" });
       if (await handleUnauthorized(response.status)) {
         return;
       }
-
       if (!response.ok) {
         const payload = (await response.json().catch(() => null)) as { detail?: string; error?: string } | null;
-        throw new Error(payload?.error ?? payload?.detail ?? "Failed to set temporary password");
+        throw new Error(payload?.error ?? payload?.detail ?? "Failed to delete user");
       }
 
-      setHrMessage(`Temporary password updated for ${user.username}.`);
+      setUsersMessage(`Deleted user ${user.username}.`);
+      await loadUsers();
     } catch (err) {
-      setHrMessage((err as Error).message || "Failed to set temporary password");
+      setUsersMessage((err as Error).message || "Failed to delete user");
     }
   }
 
@@ -440,7 +455,7 @@ export default function SettingsClient({ section }: SettingsClientProps) {
 
   return (
     <main className="mx-auto min-h-screen max-w-7xl px-4 py-6 sm:px-8">
-      <AppHeader me={me} title="Settings" subtitle="Admin Tools" onLogout={logout} />
+      <AppHeader me={me} title="Settings" subtitle="Entry/Exit Admin Tools" onLogout={logout} />
 
       {error ? (
         <div className="mb-4 rounded-xl border border-rose-400/40 bg-rose-950/30 px-4 py-3 text-sm text-rose-300">{error}</div>
@@ -568,41 +583,49 @@ export default function SettingsClient({ section }: SettingsClientProps) {
           </div>
         ) : null}
 
-        {section === "hr-users" ? (
+        {section === "users" ? (
           <div className="space-y-4">
-            <form onSubmit={createHrUser} className="grid gap-3 rounded-xl border border-zinc-800 bg-zinc-950/50 p-4 sm:grid-cols-4">
+            <form onSubmit={createUser} className="grid gap-3 rounded-xl border border-zinc-800 bg-zinc-950/50 p-4 sm:grid-cols-5">
               <input
-                value={newHrUser.email}
-                onChange={(event) => setNewHrUser((current) => ({ ...current, email: event.target.value }))}
-                placeholder="HR email"
+                value={newUser.email}
+                onChange={(event) => setNewUser((current) => ({ ...current, email: event.target.value }))}
+                placeholder="User email"
                 className="rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-cyan-400"
                 required
               />
               <input
-                value={newHrUser.username}
-                onChange={(event) => setNewHrUser((current) => ({ ...current, username: event.target.value }))}
+                value={newUser.username}
+                onChange={(event) => setNewUser((current) => ({ ...current, username: event.target.value }))}
                 placeholder="Username"
                 className="rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-cyan-400"
                 required
               />
               <input
                 type="password"
-                value={newHrUser.temp_password}
-                onChange={(event) => setNewHrUser((current) => ({ ...current, temp_password: event.target.value }))}
-                placeholder="Temp password"
+                value={newUser.password}
+                onChange={(event) => setNewUser((current) => ({ ...current, password: event.target.value }))}
+                placeholder="Password"
                 className="rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-cyan-400"
                 required
               />
+              <select
+                value={newUser.role}
+                onChange={(event) => setNewUser((current) => ({ ...current, role: event.target.value as UserRole }))}
+                className="rounded-lg border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm text-zinc-100 outline-none focus:border-cyan-400"
+              >
+                <option value="inspector">Inspector</option>
+                <option value="admin">Admin</option>
+              </select>
               <button
                 type="submit"
                 className="rounded-lg bg-cyan-500 px-4 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-cyan-400"
               >
-                Create HR User
+                Create User
               </button>
             </form>
 
-            {hrLoading ? <p className="text-sm text-zinc-400">Loading HR users...</p> : null}
-            {hrMessage ? <p className="text-sm text-zinc-300">{hrMessage}</p> : null}
+            {usersLoading ? <p className="text-sm text-zinc-400">Loading users...</p> : null}
+            {usersMessage ? <p className="text-sm text-zinc-300">{usersMessage}</p> : null}
 
             <div className="overflow-x-auto rounded-xl border border-zinc-800 table-scroll">
               <table className="min-w-full text-sm">
@@ -610,47 +633,65 @@ export default function SettingsClient({ section }: SettingsClientProps) {
                   <tr>
                     <th className="px-3 py-2 text-left font-medium">User</th>
                     <th className="px-3 py-2 text-left font-medium">Email</th>
+                    <th className="px-3 py-2 text-left font-medium">Role</th>
                     <th className="px-3 py-2 text-left font-medium">Status</th>
                     <th className="px-3 py-2 text-left font-medium">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {hrUsers.map((user) => (
+                  {users.map((user) => (
                     <tr key={user.id} className="border-t border-zinc-800">
                       <td className="px-3 py-2 text-zinc-200">{user.username}</td>
                       <td className="px-3 py-2 text-zinc-200">{user.email}</td>
+                      <td className="px-3 py-2 text-zinc-200">
+                        <select
+                          value={user.role}
+                          onChange={(event) => changeUserRole(user, event.target.value as UserRole)}
+                          className="rounded border border-zinc-700 bg-zinc-950 px-2 py-1 text-xs text-zinc-100"
+                        >
+                          <option value="admin">Admin</option>
+                          <option value="inspector">Inspector</option>
+                        </select>
+                      </td>
                       <td className="px-3 py-2 text-zinc-200">{user.is_active ? "Active" : "Disabled"}</td>
                       <td className="px-3 py-2 text-zinc-200">
                         <div className="flex flex-wrap gap-2">
                           <button
                             type="button"
-                            onClick={() => toggleHrUser(user)}
+                            onClick={() => toggleUser(user)}
                             className="rounded border border-zinc-600 px-2 py-1 text-xs hover:border-zinc-400"
                           >
                             {user.is_active ? "Disable" : "Enable"}
                           </button>
                           <button
                             type="button"
-                            onClick={() => sendResetLink(user)}
+                            onClick={() => createResetLink(user)}
                             className="rounded border border-zinc-600 px-2 py-1 text-xs hover:border-zinc-400"
                           >
                             Reset Link
                           </button>
                           <button
                             type="button"
-                            onClick={() => setTempPassword(user)}
+                            onClick={() => resetPassword(user)}
                             className="rounded border border-zinc-600 px-2 py-1 text-xs hover:border-zinc-400"
                           >
                             Temp Password
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => deleteUserRow(user)}
+                            className="rounded border border-rose-500/60 px-2 py-1 text-xs text-rose-300 hover:border-rose-400"
+                          >
+                            Delete
                           </button>
                         </div>
                       </td>
                     </tr>
                   ))}
-                  {!hrUsers.length && !hrLoading ? (
+                  {!users.length && !usersLoading ? (
                     <tr>
-                      <td colSpan={4} className="px-3 py-6 text-center text-zinc-500">
-                        No HR users found.
+                      <td colSpan={5} className="px-3 py-6 text-center text-zinc-500">
+                        No users found.
                       </td>
                     </tr>
                   ) : null}
