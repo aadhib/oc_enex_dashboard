@@ -38,6 +38,14 @@ def _format_dt(value: datetime | None) -> str | None:
     return value.strftime("%Y-%m-%d %H:%M:%S") if value else None
 
 
+def _format_time_only(value: datetime | None) -> str | None:
+    return value.strftime("%H:%M:%S") if value else None
+
+
+def _format_time_12h(value: datetime | None) -> str | None:
+    return value.strftime("%I:%M:%S %p") if value else None
+
+
 def _minutes_to_hhmm(value: int | None) -> str | None:
     if value is None or value < 0:
         return None
@@ -779,6 +787,275 @@ def _event_state(event: dict[str, Any], swap_applied: bool) -> int | None:
     return 0 if flag == 1 else 1
 
 
+def _normalize_event_sequence(
+    *,
+    events: Sequence[dict[str, Any]],
+    swap_applied: bool,
+) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    previous_state: int | None = None
+
+    for event in sorted(events, key=lambda item: item["event_time"]):
+        event_time = event.get("event_time")
+        if not isinstance(event_time, datetime):
+            continue
+
+        state = _event_state(event, swap_applied)
+        inferred = False
+
+        if state is None:
+            inferred = True
+            if previous_state is None:
+                state = 1
+            else:
+                state = 0 if previous_state == 1 else 1
+
+        normalized.append(
+            {
+                "event_time": event_time,
+                "state": state,
+                "inferred": inferred,
+            }
+        )
+        previous_state = state
+
+    return normalized
+
+
+def _event_type_label(state: int) -> str:
+    return "IN" if state == 1 else "OUT"
+
+
+def _build_daily_transactions_and_intervals(
+    *,
+    card_no: str,
+    selected_date: date,
+    swap_applied: bool,
+    detector: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    day_start = datetime.combine(selected_date, datetime.min.time())
+    day_end = day_start + timedelta(days=1)
+    window_start = day_start - timedelta(hours=12)
+    window_end = day_end + timedelta(hours=12)
+
+    raw_window_events = _fetch_events_for_card(
+        card_no=card_no,
+        start=window_start,
+        end=window_end,
+        detector=detector,
+    )
+    if not raw_window_events:
+        return {
+            "date": day_start.strftime("%Y-%m-%d"),
+            "first_in": None,
+            "last_out": None,
+            "duration_minutes": None,
+            "duration_hhmm": None,
+            "missing_punch": False,
+            "rows": [],
+            "transactions": [],
+            "intervals": [],
+            "total_in_minutes": 0,
+            "total_out_minutes": 0,
+            "total_in": _minutes_to_hhmm(0),
+            "total_out": _minutes_to_hhmm(0),
+            "totalInMinutes": 0,
+            "totalOutMinutes": 0,
+            "totalInHHMM": _minutes_to_hhmm(0),
+            "totalOutHHMM": _minutes_to_hhmm(0),
+            "notes": [],
+        }
+
+    # Daily calculations use selected day through next-day noon to capture night shifts.
+    in_scope_events = [
+        event for event in raw_window_events if day_start <= event["event_time"] < window_end
+    ]
+    normalized_events = _normalize_event_sequence(events=in_scope_events, swap_applied=swap_applied)
+
+    if not normalized_events:
+        return {
+            "date": day_start.strftime("%Y-%m-%d"),
+            "first_in": None,
+            "last_out": None,
+            "duration_minutes": None,
+            "duration_hhmm": None,
+            "missing_punch": False,
+            "rows": [],
+            "transactions": [],
+            "intervals": [],
+            "total_in_minutes": 0,
+            "total_out_minutes": 0,
+            "total_in": _minutes_to_hhmm(0),
+            "total_out": _minutes_to_hhmm(0),
+            "totalInMinutes": 0,
+            "totalOutMinutes": 0,
+            "totalInHHMM": _minutes_to_hhmm(0),
+            "totalOutHHMM": _minutes_to_hhmm(0),
+            "notes": [],
+        }
+
+    notes: list[str] = []
+
+    first_in_index: int | None = None
+    for index, event in enumerate(normalized_events):
+        event_time = event["event_time"]
+        if day_start <= event_time < day_end and event["state"] == 1:
+            first_in_index = index
+            break
+
+    out_on_day = [
+        event
+        for event in normalized_events
+        if day_start <= event["event_time"] < day_end and event["state"] == 0
+    ]
+
+    if first_in_index is None:
+        if out_on_day:
+            notes.append("No IN punch found on selected date; OUT-only transactions were ignored.")
+        return {
+            "date": day_start.strftime("%Y-%m-%d"),
+            "first_in": None,
+            "last_out": _format_dt(out_on_day[-1]["event_time"]) if out_on_day else None,
+            "duration_minutes": None,
+            "duration_hhmm": None,
+            "missing_punch": bool(out_on_day),
+            "rows": [],
+            "transactions": [],
+            "intervals": [],
+            "total_in_minutes": 0,
+            "total_out_minutes": 0,
+            "total_in": _minutes_to_hhmm(0),
+            "total_out": _minutes_to_hhmm(0),
+            "totalInMinutes": 0,
+            "totalOutMinutes": 0,
+            "totalInHHMM": _minutes_to_hhmm(0),
+            "totalOutHHMM": _minutes_to_hhmm(0),
+            "notes": notes,
+        }
+
+    first_in_dt = normalized_events[first_in_index]["event_time"]
+
+    last_out_index: int | None = None
+    for index in range(len(normalized_events) - 1, first_in_index - 1, -1):
+        event = normalized_events[index]
+        if event["event_time"] >= first_in_dt and event["state"] == 0:
+            last_out_index = index
+            break
+
+    sequence_end_index = last_out_index if last_out_index is not None else len(normalized_events) - 1
+    sequence_events = normalized_events[first_in_index : sequence_end_index + 1]
+
+    transactions: list[dict[str, Any]] = []
+    intervals: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+    total_in_minutes = 0
+    total_out_minutes = 0
+
+    open_in: datetime | None = None
+    last_out_for_break: datetime | None = None
+
+    for event in sequence_events:
+        event_time = event["event_time"]
+        state = int(event["state"])
+        inferred = bool(event["inferred"])
+        event_label = _event_type_label(state)
+
+        transactions.append(
+            {
+                "type": event_label,
+                "time": _format_time_only(event_time),
+                "timestamp": _format_dt(event_time),
+                "inferred": inferred,
+            }
+        )
+
+        if state == 1:
+            if open_in is not None:
+                # Consecutive IN values often come from repeated scans; keep earliest open IN.
+                notes.append(
+                    f"Ignored consecutive IN at {_format_dt(event_time)} while previous IN remained open."
+                )
+                continue
+
+            if last_out_for_break is not None and event_time > last_out_for_break:
+                total_out_minutes += int((event_time - last_out_for_break).total_seconds() // 60)
+                last_out_for_break = None
+
+            open_in = event_time
+            continue
+
+        if open_in is None:
+            # Leading OUTs are ignored until the first valid IN.
+            notes.append(f"Ignored OUT at {_format_dt(event_time)} without a matching prior IN.")
+            last_out_for_break = event_time
+            continue
+
+        in_minutes = int((event_time - open_in).total_seconds() // 60)
+        if in_minutes >= 0:
+            total_in_minutes += in_minutes
+            intervals.append(
+                {
+                    "date": open_in.strftime("%Y-%m-%d"),
+                    "in": _format_dt(open_in),
+                    "out": _format_dt(event_time),
+                    "in_time": _format_time_only(open_in),
+                    "out_time": _format_time_only(event_time),
+                    "in_duration_minutes": in_minutes,
+                    "in_duration_hhmm": _minutes_to_hhmm(in_minutes),
+                }
+            )
+            rows.append(
+                {
+                    "date": open_in.strftime("%Y-%m-%d"),
+                    "in": _format_time_12h(open_in),
+                    "out": _format_time_12h(event_time),
+                    "duration": _minutes_to_hhmm(in_minutes),
+                    "in_raw": _format_dt(open_in),
+                    "out_raw": _format_dt(event_time),
+                    "duration_minutes": in_minutes,
+                }
+            )
+        else:
+            # Never return negative durations.
+            notes.append(
+                f"Skipped negative IN interval from {_format_dt(open_in)} to {_format_dt(event_time)}."
+            )
+
+        open_in = None
+        last_out_for_break = event_time
+
+    if open_in is not None:
+        notes.append(f"Missing OUT after last IN at {_format_dt(open_in)}; open interval excluded from totals.")
+
+    last_out_dt = (
+        normalized_events[last_out_index]["event_time"] if last_out_index is not None else None
+    )
+    duration_minutes = _duration_minutes(first_in_dt, last_out_dt)
+    if duration_minutes is None and first_in_dt is not None and last_out_dt is None:
+        notes.append("Missing OUT punch in selected work window.")
+
+    return {
+        "date": day_start.strftime("%Y-%m-%d"),
+        "first_in": _format_dt(first_in_dt),
+        "last_out": _format_dt(last_out_dt),
+        "duration_minutes": duration_minutes,
+        "duration_hhmm": _minutes_to_hhmm(duration_minutes),
+        "missing_punch": (first_in_dt is None) ^ (last_out_dt is None),
+        "rows": rows,
+        "transactions": transactions,
+        "intervals": intervals,
+        "total_in_minutes": total_in_minutes,
+        "total_out_minutes": total_out_minutes,
+        "total_in": _minutes_to_hhmm(total_in_minutes),
+        "total_out": _minutes_to_hhmm(total_out_minutes),
+        "totalInMinutes": total_in_minutes,
+        "totalOutMinutes": total_out_minutes,
+        "totalInHHMM": _minutes_to_hhmm(total_in_minutes),
+        "totalOutHHMM": _minutes_to_hhmm(total_out_minutes),
+        "notes": notes,
+    }
+
+
 def _accumulate_segment_minutes(
     day_totals: dict[str, dict[str, int]],
     *,
@@ -1086,18 +1363,9 @@ def fetch_daily_report(card_no: str, date_value: str) -> Dict[str, Any]:
     mapping = _get_mapping_state(detector=detector)
     identity = _fetch_employee_identity(card_no)
 
-    day_record = _build_single_day_record(
+    day_record = _build_daily_transactions_and_intervals(
         card_no=card_no,
         selected_date=selected_date,
-        swap_applied=bool(mapping["swapApplied"]),
-        detector=detector,
-    )
-    day_start = datetime.combine(selected_date, datetime.min.time())
-    day_end = day_start + timedelta(days=1)
-    period_totals = _compute_period_segment_totals(
-        card_no=card_no,
-        start=day_start,
-        end=day_end,
         swap_applied=bool(mapping["swapApplied"]),
         detector=detector,
     )
@@ -1111,11 +1379,20 @@ def fetch_daily_report(card_no: str, date_value: str) -> Dict[str, Any]:
         "last_out": day_record["last_out"],
         "duration_minutes": day_record["duration_minutes"],
         "duration_hhmm": day_record["duration_hhmm"],
+        "duration": day_record["duration_hhmm"],
         "missing_punch": day_record["missing_punch"],
-        "totalInMinutes": period_totals["totalInMinutes"],
-        "totalOutMinutes": period_totals["totalOutMinutes"],
-        "totalInHHMM": period_totals["totalInHHMM"],
-        "totalOutHHMM": period_totals["totalOutHHMM"],
+        "rows": day_record["rows"],
+        "transactions": day_record["transactions"],
+        "intervals": day_record["intervals"],
+        "total_in_minutes": day_record["total_in_minutes"],
+        "total_out_minutes": day_record["total_out_minutes"],
+        "total_in": day_record["total_in"],
+        "total_out": day_record["total_out"],
+        "totalInMinutes": day_record["totalInMinutes"],
+        "totalOutMinutes": day_record["totalOutMinutes"],
+        "totalInHHMM": day_record["totalInHHMM"],
+        "totalOutHHMM": day_record["totalOutHHMM"],
+        "notes": day_record["notes"],
         "total_work_minutes": day_record["duration_minutes"],
         "mappingVariant": mapping["mappingVariant"],
         "swapApplied": mapping["swapApplied"],
@@ -1262,4 +1539,81 @@ def fetch_yearly_report(card_no: str, year_value: str) -> Dict[str, Any]:
         "total_work_minutes": total_minutes,
         "mappingVariant": mapping["mappingVariant"],
         "swapApplied": mapping["swapApplied"],
+    }
+
+
+def quick_daily_sequence_sanity() -> dict[str, dict[str, Any]]:
+    """
+    Lightweight self-check helper for interval pairing logic.
+    Not executed automatically; call manually in a REPL if needed.
+    """
+
+    def _simulate(events: list[tuple[str, int]]) -> dict[str, Any]:
+        parsed: list[tuple[datetime, int]] = [
+            (datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S"), state) for stamp, state in events
+        ]
+        parsed.sort(key=lambda item: item[0])
+
+        open_in: datetime | None = None
+        last_out: datetime | None = None
+        total_in = 0
+        total_out = 0
+
+        for event_time, state in parsed:
+            if state == 1:
+                if last_out is not None and event_time > last_out:
+                    total_out += int((event_time - last_out).total_seconds() // 60)
+                    last_out = None
+                if open_in is None:
+                    open_in = event_time
+                continue
+
+            if open_in is None:
+                last_out = event_time
+                continue
+
+            total_in += int((event_time - open_in).total_seconds() // 60)
+            open_in = None
+            last_out = event_time
+
+        return {
+            "total_in_minutes": total_in,
+            "total_out_minutes": total_out,
+            "missing_out": open_in is not None,
+        }
+
+    normal = _simulate(
+        [
+            ("2026-02-23 08:00:00", 1),
+            ("2026-02-23 09:00:00", 0),
+            ("2026-02-23 09:30:00", 1),
+            ("2026-02-23 12:00:00", 0),
+        ]
+    )
+    assert normal["total_in_minutes"] == 210  # 03:30
+    assert normal["total_out_minutes"] == 30  # 00:30
+
+    night = _simulate(
+        [
+            ("2026-02-23 21:40:00", 1),
+            ("2026-02-24 04:00:00", 0),
+        ]
+    )
+    assert night["total_in_minutes"] == 380  # 06:20
+    assert night["total_out_minutes"] == 0
+
+    missing = _simulate(
+        [
+            ("2026-02-23 09:00:00", 1),
+            ("2026-02-23 12:00:00", 0),
+            ("2026-02-23 13:00:00", 1),
+        ]
+    )
+    assert missing["total_in_minutes"] == 180
+    assert missing["missing_out"] is True
+
+    return {
+        "normal_shift": normal,
+        "night_shift": night,
+        "missing_punch": missing,
     }

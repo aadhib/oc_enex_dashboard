@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -53,11 +53,20 @@ class DailyReport(BaseModel):
     last_out: Optional[str]
     duration_minutes: Optional[int]
     duration_hhmm: Optional[str]
+    duration: Optional[str] = None
     missing_punch: bool = False
+    rows: List[dict[str, Any]] = Field(default_factory=list)
+    transactions: List[dict[str, Any]] = Field(default_factory=list)
+    intervals: List[dict[str, Any]] = Field(default_factory=list)
+    total_in_minutes: Optional[int] = None
+    total_out_minutes: Optional[int] = None
+    total_in: Optional[str] = None
+    total_out: Optional[str] = None
     totalInMinutes: Optional[int] = None
     totalOutMinutes: Optional[int] = None
     totalInHHMM: Optional[str] = None
     totalOutHHMM: Optional[str] = None
+    notes: List[str] = Field(default_factory=list)
     total_work_minutes: Optional[int] = None
     mappingVariant: str
     swapApplied: bool

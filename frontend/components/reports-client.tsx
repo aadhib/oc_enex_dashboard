@@ -25,10 +25,40 @@ type DailyReport = {
   last_out: string | null;
   duration_minutes: number | null;
   duration_hhmm: string | null;
+  duration?: string | null;
+  rows?: Array<{
+    date: string;
+    in: string;
+    out: string;
+    duration: string;
+    in_raw?: string | null;
+    out_raw?: string | null;
+    duration_minutes?: number | null;
+  }>;
+  transactions?: Array<{
+    type: "IN" | "OUT" | string;
+    time?: string | null;
+    timestamp?: string | null;
+    inferred?: boolean;
+  }>;
+  intervals?: Array<{
+    date?: string | null;
+    in?: string | null;
+    out?: string | null;
+    in_time?: string | null;
+    out_time?: string | null;
+    in_duration_minutes?: number | null;
+    in_duration_hhmm?: string | null;
+  }>;
+  total_in_minutes?: number | null;
+  total_out_minutes?: number | null;
+  total_in?: string | null;
+  total_out?: string | null;
   totalInMinutes?: number | null;
   totalOutMinutes?: number | null;
   totalInHHMM?: string | null;
   totalOutHHMM?: string | null;
+  notes?: string[];
 };
 
 type MonthlyRecord = {
@@ -441,6 +471,7 @@ export default function ReportsClient() {
   const selectedEmployee = employees.find((employee) => employee.card_no === selectedCardNo);
   const selectedDepartment =
     tab === "daily" ? dailyReport?.department : tab === "monthly" ? monthlyReport?.department : yearlyReport?.department;
+  const dailyRows = dailyReport?.rows ?? [];
 
   return (
     <main className="mx-auto min-h-screen max-w-7xl px-4 py-6 sm:px-8">
@@ -565,24 +596,41 @@ export default function ReportsClient() {
                       <thead className="bg-zinc-950/80 text-zinc-300">
                         <tr>
                           <th className="px-3 py-2 text-left font-medium">Date</th>
-                          <th className="px-3 py-2 text-left font-medium">First IN</th>
-                          <th className="px-3 py-2 text-left font-medium">Last OUT</th>
-                          <th className="px-3 py-2 text-left font-medium">Duration</th>
+                          <th className="px-3 py-2 text-left font-medium">IN</th>
+                          <th className="px-3 py-2 text-left font-medium">OUT</th>
+                          <th className="px-3 py-2 text-left font-medium">Duration (HH:MM)</th>
                         </tr>
                       </thead>
                       <tbody>
-                        <tr className="border-t border-zinc-800">
-                          <td className="px-3 py-2 text-zinc-200">{dailyReport?.date ?? dailyDate}</td>
-                          <td className="px-3 py-2 text-zinc-200">
-                            <TimeStamp value={dailyReport?.first_in ?? null} showDate={false} className="text-zinc-200" />
-                          </td>
-                          <td className="px-3 py-2 text-zinc-200">
-                            <TimeStamp value={dailyReport?.last_out ?? null} showDate={false} className="text-zinc-200" />
-                          </td>
-                          <td className="px-3 py-2 text-zinc-200">
-                            {durationLabel(dailyReport?.duration_hhmm, dailyReport?.duration_minutes)}
-                          </td>
-                        </tr>
+                        {dailyRows.map((row, index) => (
+                          <tr key={`${row.in_raw ?? row.in ?? index}-${row.out_raw ?? row.out ?? index}`} className="border-t border-zinc-800">
+                            <td className="px-3 py-2 text-zinc-200">{row.date}</td>
+                            <td className="px-3 py-2 text-zinc-200">
+                              {row.in_raw ? (
+                                <TimeStamp value={row.in_raw} showDate={false} className="text-zinc-200" />
+                              ) : (
+                                row.in
+                              )}
+                            </td>
+                            <td className="px-3 py-2 text-zinc-200">
+                              {row.out_raw ? (
+                                <TimeStamp value={row.out_raw} showDate={false} className="text-zinc-200" />
+                              ) : (
+                                row.out
+                              )}
+                            </td>
+                            <td className="px-3 py-2 text-zinc-200">
+                              {row.duration ?? durationLabel(null, row.duration_minutes ?? null)}
+                            </td>
+                          </tr>
+                        ))}
+                        {!dailyRows.length ? (
+                          <tr>
+                            <td colSpan={4} className="px-3 py-6 text-center text-zinc-500">
+                              No paired IN/OUT rows found for this date window.
+                            </td>
+                          </tr>
+                        ) : null}
                       </tbody>
                       <tfoot>
                         <tr className="border-t border-cyan-300/20 bg-cyan-500/10">
@@ -590,7 +638,11 @@ export default function ReportsClient() {
                             Total In Hour
                           </td>
                           <td className="px-3 py-2 font-medium text-cyan-100">
-                            {inOutTotalLabel(dailyReport?.totalInHHMM, dailyReport?.totalInMinutes)}
+                            {dailyReport?.total_in ??
+                              inOutTotalLabel(
+                                dailyReport?.totalInHHMM,
+                                dailyReport?.totalInMinutes ?? dailyReport?.total_in_minutes
+                              )}
                           </td>
                         </tr>
                         <tr className="border-t border-cyan-300/20 bg-cyan-500/10">
@@ -598,12 +650,27 @@ export default function ReportsClient() {
                             Total Out Hour
                           </td>
                           <td className="px-3 py-2 font-medium text-cyan-100">
-                            {inOutTotalLabel(dailyReport?.totalOutHHMM, dailyReport?.totalOutMinutes)}
+                            {dailyReport?.total_out ??
+                              inOutTotalLabel(
+                                dailyReport?.totalOutHHMM,
+                                dailyReport?.totalOutMinutes ?? dailyReport?.total_out_minutes
+                              )}
                           </td>
                         </tr>
                       </tfoot>
                     </table>
                   </div>
+
+                  {dailyReport?.notes?.length ? (
+                    <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3">
+                      <p className="text-xs uppercase tracking-[0.18em] text-amber-300/90">Notes</p>
+                      <ul className="mt-2 space-y-1 text-sm text-amber-200/90">
+                        {dailyReport.notes.map((note, index) => (
+                          <li key={`${note}-${index}`}>{note}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  ) : null}
                 </div>
               ) : null}
 
